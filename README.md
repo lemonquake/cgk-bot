@@ -61,6 +61,15 @@ Follow these numbered steps to set up and run the bot.
 
 ### Phase 2: Running the Bot on Your Computer
 
+### Quick Start Launchers (Easiest Way to Run)
+
+- **On Mac:** Simply double-click [`start_bot.command`](file:///Users/lemonquake/Engines/cgk-bot/start_bot.command). It automatically checks the virtual environment, verifies requirements, and starts the bot.
+- **On Windows:** Simply double-click [`start_bot.cmd`](file:///Users/lemonquake/Engines/cgk-bot/start_bot.cmd).
+
+---
+
+### Manual Terminal Setup (Step-by-Step)
+
 #### Step 7: Open Your Terminal
 Open the Terminal application on your computer and navigate to the project directory:
 ```bash
@@ -100,7 +109,7 @@ You will see output indicating that the bot has connected:
 [INFO] cgk_bot: Loading extensions...
 [INFO] cgk_bot: Synced 1 global command(s).
 [INFO] cgk_bot: ==========================================
-[INFO] cgk_bot: Logged in as: CGK Linens Bot (ID: ...)
+[INFO] cgk_bot: Logged in as: CGK Bot (ID: ...)
 [INFO] cgk_bot: Bot is active in 1 server(s)
 [INFO] cgk_bot: ==========================================
 ```
@@ -134,6 +143,8 @@ cgk-bot/
 ├── .env.example          # Safe template for configuration
 ├── .gitignore            # Keeps private files out of Git
 ├── requirements.txt      # Python dependencies
+├── start_bot.command     # 1-Click launcher for macOS
+├── start_bot.cmd         # 1-Click launcher for Windows
 ├── config.py             # Global constants and brand theme
 ├── main.py               # Main bot launcher and persistent view registration
 ├── cogs/
