@@ -23,9 +23,24 @@ fi
 # Activate virtual environment
 source venv/bin/activate
 
-# Ensure dependencies are installed
+# Ensure dependencies are installed.
+# The packages are checked locally first: contacting PyPI on every launch is
+# what used to leave this step hanging on a slow or blocked connection, and
+# nothing needs downloading once the environment is built.
 echo "[2/3] Checking dependencies..."
-pip install -r requirements.txt --quiet
+if python3 -c "import importlib.metadata as m, discord, dotenv; m.version('tzdata')" >/dev/null 2>&1; then
+    echo "      All packages present - skipping download."
+else
+    echo "      Some packages are missing - installing from requirements.txt..."
+    python3 -m pip install -r requirements.txt --disable-pip-version-check --no-input --timeout 30 --retries 2
+    if [ $? -ne 0 ]; then
+        echo ""
+        echo "Error: Could not install the dependencies."
+        echo "Check your internet connection, then run this launcher again."
+        read -p "Press [Enter] to exit..."
+        exit 1
+    fi
+fi
 
 # Launch bot
 echo "[3/3] Launching bot..."

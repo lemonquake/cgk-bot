@@ -3,14 +3,22 @@ Main entry point for the CGK Linens Discord Bot.
 Created by Aljay Leodones for CGK Linens.
 """
 
-import asyncio
 import logging
 import sys
+
 import discord
 from discord.ext import commands
 
-from config import DISCORD_TOKEN, GUILD_ID, BRAND_NAME
+from config import (
+    BRAND_NAME,
+    DISCORD_TOKEN,
+    ENABLE_PRESENCE_INTENT,
+    GUILD_ID,
+)
+from views.announcement_view import AnnouncementHubView
+from views.member_report_view import MemberReportHubView
 from views.mod_panel_view import ModPanelView
+from views.onboarding_view import OnboardingHubView
 
 # Configure logging
 logging.basicConfig(
@@ -20,15 +28,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cgk_bot")
 
+EXTENSIONS = (
+    "cogs.engagement",
+    "cogs.engagement_contest",
+    "cogs.onboarding",
+    "cogs.memberreport",
+    "cogs.announcements",
+    "cogs.message_editor",
+    "cogs.mod_panel",
+)
+
 
 class CGKBot(commands.Bot):
     """Custom Bot class for CGK Linens management."""
 
-    def __init__(self):
+    def __init__(self, *, use_presences: bool = True):
         intents = discord.Intents.default()
         intents.guilds = True
         intents.members = True
         intents.message_content = True
+        intents.presences = use_presences
 
         super().__init__(
             command_prefix="!",
@@ -39,11 +58,15 @@ class CGKBot(commands.Bot):
     async def setup_hook(self):
         """Initializes persistent views, cogs, and slash command trees."""
         logger.info("Registering persistent views...")
-        # Register the persistent ModPanelView so buttons work across restarts
+        # Static custom_ids keep every panel button alive across restarts.
         self.add_view(ModPanelView())
+        self.add_view(OnboardingHubView())
+        self.add_view(MemberReportHubView())
+        self.add_view(AnnouncementHubView())
 
         logger.info("Loading extensions...")
-        await self.load_extension("cogs.mod_panel")
+        for extension in EXTENSIONS:
+            await self.load_extension(extension)
 
         # Command synchronization
         if GUILD_ID:
@@ -60,6 +83,9 @@ class CGKBot(commands.Bot):
         logger.info("==========================================")
         logger.info("Logged in as: %s (ID: %s)", self.user.name, self.user.id)
         logger.info("Bot is active in %d server(s)", len(self.guilds))
+        logger.info(
+            "Presence tracking: %s", "on" if self.intents.presences else "off"
+        )
         logger.info("==========================================")
 
         # Set bot presence status
@@ -81,8 +107,17 @@ def run():
         )
         sys.exit(1)
 
-    bot = CGKBot()
-    bot.run(DISCORD_TOKEN)
+    try:
+        CGKBot(use_presences=ENABLE_PRESENCE_INTENT).run(DISCORD_TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        # The Presence Intent switch is off in the Discord Developer Portal.
+        # Everything except the "Online now" metric works without it, so the
+        # bot restarts itself instead of refusing to start.
+        logger.warning(
+            "Presence Intent is disabled in the Discord Developer Portal. "
+            "Starting without it — enable it there to track online members."
+        )
+        CGKBot(use_presences=False).run(DISCORD_TOKEN)
 
 
 if __name__ == "__main__":
