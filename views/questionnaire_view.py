@@ -17,8 +17,8 @@ def questionnaire_embed():
             "Click **Start onboarding** to complete your member questionnaire.\n\n"
             "1. What's your TikTok handle?\n"
             "2. What's your email?\n"
-            "3. What's your TikTok GMV for the last 30 days?\n"
-            "4. What's your phone number?\n"
+            "3. What's your phone number?\n"
+            "4. What's your TikTok GMV for the last 30 days?\n"
             "5. What's your birthday? **Optional** — share it if you'd like us to know when to say happy birthday!\n\n"
             "Your answers are saved by the bot and shared with our team in a private Slack channel. "
             "They won't be posted in this Discord channel. Only the birthday is optional; no birth year is needed."
@@ -35,8 +35,8 @@ class QuestionnaireModal(discord.ui.Modal):
         fields = (
             ("tt_handle", "What's your TT handle?", "@yourhandle", 100, True),
             ("email", "What's your email?", "name@example.com", 254, True),
-            ("gmv", "What's your TT last 30 days GMV?", "Include currency, e.g. USD 5,000 (or USD 0)", 100, True),
             ("phone", "What's your phone number?", "Include your country code, e.g. +1 555 123 4567", 30, True),
+            ("gmv", "What's your TT last 30 days GMV?", "Include currency, e.g. USD 5,000 (or USD 0)", 100, True),
             ("birthday", "What's your birthday? (optional)", "MM/DD — so we know when to say happy birthday!", 5, False),
         )
         self.inputs = {}

@@ -486,7 +486,7 @@ Created by **Aljay Leodones** for **CGK Linens**.
 
 ## Member questionnaire and Slack responses
 
-Use `/onboarding` or the mod panel Onboarding button to publish the member form in Introduce Yourself. The five questions collect TikTok handle, email, last 30 days TikTok GMV, phone number, and an optional birthday. The member's Discord account is captured automatically. Responses are saved locally and sent to the brand's private Slack channel.
+Use `/onboarding` or the mod panel Onboarding button to publish the member form in Introduce Yourself. The five questions collect TikTok handle, email, phone number, last 30 days TikTok GMV, and an optional birthday. The member's Discord account is captured automatically. Responses are saved locally and sent to the brand's private Slack channel.
 
 To post the form somewhere else too, open **ℹ️ Information Onboarding** and press **Post questionnaire**, pick any channel and press **📝 Post questionnaire**. Press it again for another copy or pick another channel — every copy works the same and survives restarts.
 

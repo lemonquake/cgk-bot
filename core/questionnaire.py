@@ -49,6 +49,7 @@ def slack_payload(brand: str, record: dict) -> dict:
     fields = [
         ("TikTok handle", answers["tt_handle"]),
         ("Email", answers["email"]),
+        ("Phone number", answers["phone"]),
         ("TikTok GMV — last 30 days", answers["gmv"]),
         ("Birthday (MM/DD)", answers.get("birthday") or "Not provided"),
         ("Discord account", record["discord_account"]),
@@ -56,7 +57,6 @@ def slack_payload(brand: str, record: dict) -> dict:
         ("Discord server ID", str(record["guild_id"])),
         ("Submitted (UTC)", record["submitted_at"]),
         ("Submission ID", record["submission_id"]),
-        ("Phone number", answers["phone"]),
     ]
     # Plain text blocks prevent answers from injecting links, mentions or formatting.
     return {
@@ -72,9 +72,9 @@ def slack_payload(brand: str, record: dict) -> dict:
 
 
 SHEET_COLUMNS = [
-    "Submitted (UTC)", "TikTok handle", "Email",
+    "Submitted (UTC)", "TikTok handle", "Email", "Phone number",
     "TikTok GMV — last 30 days", "Birthday (MM/DD)", "Discord account",
-    "Discord user ID", "Discord server ID", "Submission ID", "Phone number", "Slack status",
+    "Discord user ID", "Discord server ID", "Submission ID", "Slack status",
 ]
 SLACK_STATUS = {"sent": "Sent", "pending": "Waiting", "blocked": "Needs attention"}
 

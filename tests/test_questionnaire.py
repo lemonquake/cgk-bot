@@ -61,11 +61,11 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(phone=bad), self.assertRaises(ValueError):
                 validate_answers({**ANSWERS, "phone": bad})
 
-    def test_slack_message_ends_with_phone(self):
+    def test_slack_message_lists_phone_after_email(self):
         record = dict(answers=ANSWERS, discord_account="actual", guild_id=1, user_id=2,
                       submission_id="3", submitted_at="now")
         labels = [b["text"]["text"].split("\n")[0] for b in slack_payload("Test Brand", record)["blocks"][1:]]
-        self.assertEqual(labels[-1], "Phone number")
+        self.assertEqual(labels[:3], ["TikTok handle", "Email", "Phone number"])
         self.assertNotIn("Discord handle (provided)", labels)
 
     def test_slack_urls_only(self):
@@ -159,11 +159,11 @@ class QuestionnaireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.cog.session.calls), 1)
         self.assertEqual((await self.row())["status"], "blocked")
 
-    async def test_form_has_four_required_fields_and_phone_before_birthday(self):
+    async def test_form_has_four_required_fields_with_phone_after_email(self):
         modal = QuestionnaireModal(SimpleNamespace(id=2))
         self.assertEqual(len(modal.children), 5)
         self.assertEqual(sum(field.required for field in modal.children), 4)
-        self.assertEqual(list(modal.inputs), ["tt_handle", "email", "gmv", "phone", "birthday"])
+        self.assertEqual(list(modal.inputs), ["tt_handle", "email", "phone", "gmv", "birthday"])
         self.assertFalse(modal.inputs["birthday"].required)
         self.assertTrue(modal.inputs["phone"].required)
         self.assertTrue(self.cog.view.is_persistent())
