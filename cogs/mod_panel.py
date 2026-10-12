@@ -7,9 +7,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from cogs.questionnaire import publish_questionnaire
+from views.common import require_manage
+
 from views.engagement_contest_view import (
-    EngagementContestRangeView,
-    build_contest_prompt_embed,
+    EngagementContestHubView,
+    build_contest_hub_embed,
 )
 from views.member_report_view import MemberReportHubView, build_report_hub_embed
 from views.mod_panel_view import ModPanelView, build_mod_panel_embed
@@ -35,14 +38,17 @@ class ModPanelCog(commands.Cog):
 
     @app_commands.command(
         name="onboarding",
-        description="Post the persistent member onboarding panel in this channel.",
+        description="Post the member questionnaire in Introduce Yourself and open onboarding tools.",
     )
     @app_commands.default_permissions(manage_guild=True)
     async def onboarding_command(self, interaction: discord.Interaction):
-        """Posts the standalone onboarding hub (also reachable from /summon)."""
-        await interaction.response.defer()
+        """Publishes the member form and privately opens moderator tools."""
+        if not await require_manage(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        notice = await publish_questionnaire(interaction)
         embed = await build_hub_embed(interaction)
-        await interaction.followup.send(embed=embed, view=OnboardingHubView())
+        await interaction.followup.send(content=notice, embed=embed, view=OnboardingHubView(), ephemeral=True)
 
     @app_commands.command(
         name="community-report",
@@ -57,14 +63,16 @@ class ModPanelCog(commands.Cog):
 
     @app_commands.command(
         name="engagement-contest",
-        description="Launch and post the Engagement Contest Top 15 Leaderboard.",
+        description="Start, publish, end or review the Engagement Contest.",
     )
     @app_commands.default_permissions(manage_guild=True)
     async def engagement_contest_command(self, interaction: discord.Interaction):
-        """Opens the Engagement Contest timeframe selector (also reachable from /summon)."""
-        embed = build_contest_prompt_embed()
-        await interaction.response.send_message(
-            embed=embed, view=EngagementContestRangeView(), ephemeral=True
+        """Opens the Engagement Contest hub (also reachable from /summon)."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.followup.send(
+            embed=await build_contest_hub_embed(interaction),
+            view=EngagementContestHubView(),
+            ephemeral=True,
         )
 
 

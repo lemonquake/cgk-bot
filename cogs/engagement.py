@@ -478,7 +478,12 @@ class EngagementCog(commands.Cog, name="EngagementCog"):
         stats: HistorySyncStats,
     ) -> list[discord.Thread]:
         """Finds active and relevant archived threads visible to the bot."""
-        threads = {thread.id: thread for thread in guild.active_threads()}
+        threads: dict[int, discord.Thread] = {}
+        try:
+            for thread in await guild.active_threads():
+                threads[thread.id] = thread
+        except (discord.Forbidden, discord.HTTPException):
+            stats.locations_skipped += 1
 
         async def collect(iterator: object) -> None:
             try:

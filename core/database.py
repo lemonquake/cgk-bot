@@ -29,6 +29,43 @@ CREATE TABLE IF NOT EXISTS onboarded_members (
     PRIMARY KEY (user_id, guild_id)
 );
 
+-- ── Creator onboarding (TikTok Shop question) ───────────────
+-- A separate log from `onboarded_members`, so a member welcomed by
+-- Information Onboarding still shows up in the creator onboarding scan.
+CREATE TABLE IF NOT EXISTS creator_onboarded_members (
+    user_id      INTEGER NOT NULL,
+    guild_id     INTEGER NOT NULL,
+    onboarded_at TEXT DEFAULT (datetime('now')),
+    onboarded_by INTEGER,
+    PRIMARY KEY (user_id, guild_id)
+);
+
+-- The latest answers each member gave to the creator questions.
+CREATE TABLE IF NOT EXISTS creator_onboarding_answers (
+    user_id    INTEGER NOT NULL,
+    guild_id   INTEGER NOT NULL,
+    is_creator INTEGER NOT NULL,          -- 1 = YES, 0 = NO
+    journey    TEXT,                      -- 'learning' | 'experienced'
+    updated_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, guild_id)
+);
+
+-- ── CGK Onboarding (private per-member channels) ────────────
+CREATE TABLE IF NOT EXISTS cgk_onboarding_members (
+    user_id      INTEGER NOT NULL,
+    guild_id     INTEGER NOT NULL,
+    channel_id   INTEGER,                 -- their private <handle>-onboarding channel
+    batch_id     INTEGER,                 -- the send that tagged them; NULL = not tagged
+    tagged_at    REAL,                    -- unix time of that send
+    tagged_by    INTEGER,
+    completed_at REAL,                    -- questionnaire done, access role granted
+    PRIMARY KEY (user_id, guild_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cgk_onboarding_channel
+    ON cgk_onboarding_members (guild_id, channel_id);
+CREATE INDEX IF NOT EXISTS idx_cgk_onboarding_batch
+    ON cgk_onboarding_members (guild_id, batch_id);
+
 -- ── Daily member snapshots (growth baselines) ───────────────
 CREATE TABLE IF NOT EXISTS member_snapshots (
     guild_id      INTEGER NOT NULL,

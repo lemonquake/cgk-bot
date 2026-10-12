@@ -2,27 +2,35 @@
 Unit tests for the Engagement Contest feature.
 """
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import MagicMock
-from zoneinfo import ZoneInfo
 
 from cogs.engagement_contest import (
     ContestEvent,
     ContestStore,
+    StoredEvent,
+    build_standings,
     contains_tiktok_link,
+    content_fingerprint,
+    extract_tiktok_links,
     is_contest_channel,
     is_excluded_member,
+    is_genuine_message,
+    meaningful_word_count,
+    normalize_message_text,
+    video_fingerprint,
 )
 from config import (
     CONTEST_CHANNEL_IDS,
     CONTEST_EXCLUDED_ROLE_IDS,
+    CONTEST_MESSAGE_COOLDOWN_SECONDS,
+    CONTEST_MIN_MESSAGE_WORDS,
     CONTEST_POINTS_MESSAGE,
     CONTEST_POINTS_REACTION,
     CONTEST_POINTS_TIKTOK,
-    REPORT_TIMEZONE,
 )
 from views.engagement_contest_view import (
     _parse_custom_contest_range,
@@ -30,15 +38,81 @@ from views.engagement_contest_view import (
     get_today_range,
 )
 
+NOW = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
+COOLDOWN_GAP = timedelta(seconds=CONTEST_MESSAGE_COOLDOWN_SECONDS + 1)
+
+
+def message_event(
+    user_id: int,
+    text: str,
+    *,
+    offset_seconds: int = 0,
+    key: str | None = None,
+    name: str = "Member",
+) -> StoredEvent:
+    """A raw message event as the bot would have stored it."""
+    return StoredEvent(
+        user_id=user_id,
+        user_name=name,
+        event_type="message",
+        occurred_at=NOW + timedelta(seconds=offset_seconds),
+        event_key=key or f"contest_msg:{user_id}:{offset_seconds}",
+        content_hash=content_fingerprint(text),
+        word_count=meaningful_word_count(text),
+    )
+
+
+def tiktok_event(
+    user_id: int, url: str, *, offset_seconds: int = 0, key: str | None = None
+) -> StoredEvent:
+    return StoredEvent(
+        user_id=user_id,
+        user_name="Member",
+        event_type="tiktok",
+        occurred_at=NOW + timedelta(seconds=offset_seconds),
+        event_key=key or f"contest_msg:{user_id}:{offset_seconds}",
+        content_hash=video_fingerprint([url]),
+    )
+
+
+def reaction_event(user_id: int, *, offset_seconds: int = 0) -> StoredEvent:
+    return StoredEvent(
+        user_id=user_id,
+        user_name="Member",
+        event_type="reaction",
+        occurred_at=NOW + timedelta(seconds=offset_seconds),
+        event_key=f"contest_reaction:{user_id}:{offset_seconds}",
+    )
+
+
+class TestPointValues(unittest.TestCase):
+    """The agreed contest mechanics."""
+
+    def test_configured_weighting(self):
+        self.assertEqual(CONTEST_POINTS_MESSAGE, 2)
+        self.assertEqual(CONTEST_POINTS_REACTION, 1)
+        self.assertEqual(CONTEST_POINTS_TIKTOK, 10)
+
+    def test_counted_channels(self):
+        self.assertEqual(
+            CONTEST_CHANNEL_IDS,
+            {
+                1490809573194469436,
+                1490808945512550461,
+                1545143862539067403,
+                1490808644185624627,
+            },
+        )
+
 
 class TestTikTokLinkDetection(unittest.TestCase):
     def test_standard_tiktok_urls(self):
         self.assertTrue(
-            contains_tiktok_link("Check this out https://www.tiktok.com/@user/video/1234567890123")
+            contains_tiktok_link(
+                "Check this out https://www.tiktok.com/@user/video/1234567890123"
+            )
         )
-        self.assertTrue(
-            contains_tiktok_link("https://tiktok.com/@brand/video/9876543210")
-        )
+        self.assertTrue(contains_tiktok_link("https://tiktok.com/@brand/video/9876543210"))
 
     def test_short_and_mobile_urls(self):
         self.assertTrue(contains_tiktok_link("https://vt.tiktok.com/ZS2xYAbc/"))
@@ -48,7 +122,8 @@ class TestTikTokLinkDetection(unittest.TestCase):
     def test_urls_with_query_parameters(self):
         self.assertTrue(
             contains_tiktok_link(
-                "My submission: https://www.tiktok.com/@cgk/video/12345?is_from_webapp=1&sender_device=pc"
+                "My submission: https://www.tiktok.com/@cgk/video/12345"
+                "?is_from_webapp=1&sender_device=pc"
             )
         )
 
@@ -69,6 +144,189 @@ class TestTikTokLinkDetection(unittest.TestCase):
         mock_embed_desc.url = None
         mock_embed_desc.description = "Link here: https://vt.tiktok.com/ABC/"
         self.assertTrue(contains_tiktok_link(None, embeds=[mock_embed_desc]))
+
+    def test_distinct_links_are_deduplicated(self):
+        links = extract_tiktok_links(
+            "https://www.tiktok.com/@a/video/1 and again "
+            "https://www.tiktok.com/@a/video/1 plus https://vt.tiktok.com/ZZZ/"
+        )
+        self.assertEqual(len(links), 2)
+
+
+class TestGenuineMessageRules(unittest.TestCase):
+    def test_min_word_threshold_is_more_than_two(self):
+        self.assertEqual(CONTEST_MIN_MESSAGE_WORDS, 3)
+
+    def test_short_messages_are_not_genuine(self):
+        self.assertFalse(is_genuine_message("ok"))
+        self.assertFalse(is_genuine_message("nice one"))
+        self.assertFalse(is_genuine_message("+1"))
+        self.assertFalse(is_genuine_message(""))
+        self.assertFalse(is_genuine_message(None))
+
+    def test_three_real_words_qualify(self):
+        self.assertTrue(is_genuine_message("this looks amazing"))
+        self.assertTrue(
+            is_genuine_message("I love the new linen collection so much")
+        )
+
+    def test_links_mentions_and_emoji_are_not_words(self):
+        self.assertFalse(
+            is_genuine_message("<@123456789> https://example.com/a/b <:party:99887766>")
+        )
+        self.assertEqual(meaningful_word_count("check https://example.com now"), 2)
+        self.assertFalse(is_genuine_message("check https://example.com now"))
+
+    def test_normalization_collapses_punctuation_and_case(self):
+        self.assertEqual(
+            normalize_message_text("OMG!!! This  is   GREAT???"),
+            "omg this is great",
+        )
+        self.assertEqual(
+            content_fingerprint("So beautiful!!!"),
+            content_fingerprint("so   beautiful"),
+        )
+
+
+class TestScoringEngine(unittest.TestCase):
+    def test_basic_point_arithmetic(self):
+        events = [
+            message_event(1, "this linen set is gorgeous", offset_seconds=0),
+            message_event(1, "where can I order this one", offset_seconds=60),
+            tiktok_event(1, "https://www.tiktok.com/@a/video/1", offset_seconds=120),
+            reaction_event(1, offset_seconds=130),
+            reaction_event(1, offset_seconds=140),
+        ]
+        standings, stats = build_standings(events)
+        self.assertEqual(len(standings), 1)
+        # 2 messages (4) + 1 tiktok (10) + 2 reactions (2) = 16
+        self.assertEqual(standings[0].total_points, 16)
+        self.assertEqual(standings[0].messages, 2)
+        self.assertEqual(standings[0].tiktoks, 1)
+        self.assertEqual(standings[0].reactions, 2)
+        self.assertEqual(stats.total_filtered, 0)
+
+    def test_too_short_messages_score_nothing(self):
+        events = [
+            message_event(1, "ok", offset_seconds=0),
+            message_event(1, "nice", offset_seconds=60),
+            message_event(1, "great", offset_seconds=120),
+        ]
+        standings, stats = build_standings(events)
+        self.assertEqual(standings, [])
+        self.assertEqual(stats.too_short, 3)
+
+    def test_same_member_repeating_text_scores_once(self):
+        events = [
+            message_event(1, "good morning everyone here", offset_seconds=0),
+            message_event(1, "good morning everyone here", offset_seconds=3600),
+            message_event(1, "good morning everyone here", offset_seconds=7200),
+        ]
+        standings, stats = build_standings(events)
+        self.assertEqual(standings[0].messages, 1)
+        self.assertEqual(standings[0].total_points, CONTEST_POINTS_MESSAGE)
+        self.assertEqual(stats.repeated, 2)
+
+    def test_same_member_may_repeat_after_the_window(self):
+        events = [
+            message_event(1, "good morning everyone here", offset_seconds=0),
+            message_event(
+                1, "good morning everyone here", offset_seconds=int(timedelta(hours=25).total_seconds())
+            ),
+        ]
+        standings, stats = build_standings(events)
+        self.assertEqual(standings[0].messages, 2)
+        self.assertEqual(stats.repeated, 0)
+
+    def test_copy_pasted_text_only_scores_for_the_first_poster(self):
+        events = [
+            message_event(1, "this bedding collection is stunning", offset_seconds=0),
+            message_event(2, "this bedding collection is stunning", offset_seconds=30),
+            message_event(3, "this bedding collection is stunning", offset_seconds=60),
+        ]
+        standings, stats = build_standings(events)
+        self.assertEqual(len(standings), 1)
+        self.assertEqual(standings[0].user_id, 1)
+        self.assertEqual(stats.copy_pasted, 2)
+
+    def test_copy_paste_block_expires(self):
+        events = [
+            message_event(1, "this bedding collection is stunning", offset_seconds=0),
+            message_event(
+                2,
+                "this bedding collection is stunning",
+                offset_seconds=int(timedelta(hours=2).total_seconds()),
+            ),
+        ]
+        standings, stats = build_standings(events)
+        self.assertEqual(len(standings), 2)
+        self.assertEqual(stats.copy_pasted, 0)
+
+    def test_rapid_fire_bursts_are_rate_limited(self):
+        events = [
+            message_event(1, "first genuine thought here", offset_seconds=0),
+            message_event(1, "second genuine thought here", offset_seconds=1),
+            message_event(1, "third genuine thought here", offset_seconds=2),
+        ]
+        standings, stats = build_standings(events)
+        self.assertEqual(standings[0].messages, 1)
+        self.assertEqual(stats.rate_limited, 2)
+
+    def test_messages_outside_the_cooldown_all_score(self):
+        gap = int(COOLDOWN_GAP.total_seconds())
+        events = [
+            message_event(1, "first genuine thought here", offset_seconds=0),
+            message_event(1, "second genuine thought here", offset_seconds=gap),
+            message_event(1, "third genuine thought here", offset_seconds=gap * 2),
+        ]
+        standings, stats = build_standings(events)
+        self.assertEqual(standings[0].messages, 3)
+        self.assertEqual(stats.rate_limited, 0)
+
+    def test_same_clip_reposted_scores_once_per_member(self):
+        url = "https://www.tiktok.com/@cgk/video/555"
+        events = [
+            tiktok_event(1, url, offset_seconds=0, key="a"),
+            tiktok_event(1, url, offset_seconds=600, key="b"),
+            tiktok_event(2, url, offset_seconds=900, key="c"),
+        ]
+        standings, stats = build_standings(events)
+        by_user = {item.user_id: item for item in standings}
+        self.assertEqual(by_user[1].tiktoks, 1)
+        self.assertEqual(by_user[2].tiktoks, 1)
+        self.assertEqual(stats.duplicate_videos, 1)
+
+    def test_video_posts_are_exempt_from_the_word_rule(self):
+        events = [tiktok_event(1, "https://vt.tiktok.com/ABC/", offset_seconds=0)]
+        standings, _ = build_standings(events)
+        self.assertEqual(standings[0].total_points, CONTEST_POINTS_TIKTOK)
+
+    def test_ranking_order_and_zero_point_members_dropped(self):
+        events = [
+            # User 1: one video = 10 pts
+            tiktok_event(1, "https://www.tiktok.com/@a/video/1", offset_seconds=0),
+            # User 2: three genuine messages = 6 pts
+            message_event(2, "the napkins look so soft", offset_seconds=0),
+            message_event(2, "I ordered mine last week", offset_seconds=60),
+            message_event(2, "shipping was really quick too", offset_seconds=120),
+            # User 3: only short messages, should not appear at all
+            message_event(3, "nice", offset_seconds=0),
+        ]
+        standings, _ = build_standings(events)
+        self.assertEqual([item.user_id for item in standings], [1, 2])
+        self.assertEqual(standings[0].total_points, 10)
+        self.assertEqual(standings[1].total_points, 6)
+
+    def test_scoring_is_deterministic_regardless_of_input_order(self):
+        events = [
+            message_event(1, "this bedding collection is stunning", offset_seconds=0),
+            message_event(2, "this bedding collection is stunning", offset_seconds=30),
+        ]
+        forward, _ = build_standings(events)
+        backward, _ = build_standings(list(reversed(events)))
+        self.assertEqual(
+            [item.as_dict() for item in forward], [item.as_dict() for item in backward]
+        )
 
 
 class TestContestChannelFilter(unittest.TestCase):
@@ -91,6 +349,13 @@ class TestContestChannelFilter(unittest.TestCase):
         mock_channel.parent_id = None
         self.assertFalse(is_contest_channel(mock_channel))
         self.assertFalse(is_contest_channel(None))
+
+    def test_retired_channels_are_no_longer_counted(self):
+        for retired in (1534244419752956024, 1539653929313374290, 1534246299413647442):
+            mock_channel = MagicMock()
+            mock_channel.id = retired
+            mock_channel.parent_id = None
+            self.assertFalse(is_contest_channel(mock_channel))
 
 
 class TestExcludedMemberFilter(unittest.TestCase):
@@ -118,73 +383,123 @@ class TestExcludedMemberFilter(unittest.TestCase):
         self.assertFalse(is_excluded_member(mock_member))
 
 
-class TestContestStoreAndScoring(unittest.IsolatedAsyncioTestCase):
+class TestContestStore(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "test_contest.sqlite3"
         self.store = ContestStore(self.db_path)
         await self.store.initialize()
+        self.guild_id = 1000
+        self.channel_id = next(iter(CONTEST_CHANNEL_IDS))
 
     async def asyncTearDown(self):
         await self.store.close()
         self.temp_dir.cleanup()
 
-    async def test_record_and_aggregate_scoring(self):
-        guild_id = 1000
-        channel_id = next(iter(CONTEST_CHANNEL_IDS))
-        now = datetime.now(timezone.utc)
-
-        events = [
-            # User 1: 2 messages (2 * 3 = 6 pts), 1 TikTok (5 pts), 3 reactions (3 * 1 = 3 pts) -> 14 pts
-            ContestEvent(guild_id, 101, "Alice", channel_id, "message", now - timedelta(hours=2), "msg:1", CONTEST_POINTS_MESSAGE),
-            ContestEvent(guild_id, 101, "Alice", channel_id, "message", now - timedelta(hours=1), "msg:2", CONTEST_POINTS_MESSAGE),
-            ContestEvent(guild_id, 101, "Alice", channel_id, "tiktok", now - timedelta(minutes=45), "msg:3", CONTEST_POINTS_TIKTOK),
-            ContestEvent(guild_id, 101, "Alice", channel_id, "reaction", now - timedelta(minutes=30), "react:1", CONTEST_POINTS_REACTION),
-            ContestEvent(guild_id, 101, "Alice", channel_id, "reaction", now - timedelta(minutes=20), "react:2", CONTEST_POINTS_REACTION),
-            ContestEvent(guild_id, 101, "Alice", channel_id, "reaction", now - timedelta(minutes=10), "react:3", CONTEST_POINTS_REACTION),
-
-            # User 2: 5 messages (5 * 3 = 15 pts) -> 15 pts
-            ContestEvent(guild_id, 102, "Bob", channel_id, "message", now - timedelta(hours=3), "msg:4", CONTEST_POINTS_MESSAGE),
-            ContestEvent(guild_id, 102, "Bob", channel_id, "message", now - timedelta(hours=2), "msg:5", CONTEST_POINTS_MESSAGE),
-            ContestEvent(guild_id, 102, "Bob", channel_id, "message", now - timedelta(hours=1), "msg:6", CONTEST_POINTS_MESSAGE),
-            ContestEvent(guild_id, 102, "Bob", channel_id, "message", now - timedelta(minutes=50), "msg:7", CONTEST_POINTS_MESSAGE),
-            ContestEvent(guild_id, 102, "Bob", channel_id, "message", now - timedelta(minutes=40), "msg:8", CONTEST_POINTS_MESSAGE),
-
-            # User 3: 2 TikTok posts (2 * 5 = 10 pts), 1 reaction (1 pt) -> 11 pts
-            ContestEvent(guild_id, 103, "Charlie", channel_id, "tiktok", now - timedelta(hours=1), "msg:9", CONTEST_POINTS_TIKTOK),
-            ContestEvent(guild_id, 103, "Charlie", channel_id, "tiktok", now - timedelta(minutes=30), "msg:10", CONTEST_POINTS_TIKTOK),
-            ContestEvent(guild_id, 103, "Charlie", channel_id, "reaction", now - timedelta(minutes=5), "react:4", CONTEST_POINTS_REACTION),
-        ]
-
-        inserted = await self.store.record_events(events)
-        self.assertEqual(inserted, len(events))
-
-        # Duplicate event insertion test (idempotence)
-        dup_inserted = await self.store.record_events([events[0]])
-        self.assertEqual(dup_inserted, 0)
-
-        results = await self.store.aggregate(
-            guild_id, now - timedelta(hours=24), now + timedelta(minutes=1)
+    def _event(self, user_id, text, event_type, offset, key):
+        return ContestEvent(
+            guild_id=self.guild_id,
+            user_id=user_id,
+            user_name="Member",
+            channel_id=self.channel_id,
+            event_type=event_type,
+            occurred_at=NOW + timedelta(seconds=offset),
+            event_key=key,
+            points=0,
+            content_hash=content_fingerprint(text),
+            word_count=meaningful_word_count(text),
         )
 
-        self.assertEqual(len(results), 3)
-        # Bob should be #1 with 15 pts
-        self.assertEqual(results[0].user_id, 102)
-        self.assertEqual(results[0].total_points, 15)
-        self.assertEqual(results[0].messages, 5)
+    async def test_round_trip_and_idempotence(self):
+        events = [
+            self._event(101, "this linen feels incredible", "message", 0, "m1"),
+            self._event(101, "ordering another set today", "message", 60, "m2"),
+            self._event(101, "", "reaction", 90, "r1"),
+        ]
+        self.assertEqual(await self.store.record_events(events), 3)
+        self.assertEqual(await self.store.record_events([events[0]]), 0)
 
-        # Alice should be #2 with 14 pts
-        self.assertEqual(results[1].user_id, 101)
-        self.assertEqual(results[1].total_points, 14)
-        self.assertEqual(results[1].messages, 2)
-        self.assertEqual(results[1].tiktoks, 1)
-        self.assertEqual(results[1].reactions, 3)
+        standings = await self.store.aggregate(
+            self.guild_id, NOW - timedelta(hours=1), NOW + timedelta(hours=1)
+        )
+        self.assertEqual(len(standings), 1)
+        # 2 messages (4 pts) + 1 reaction (1 pt)
+        self.assertEqual(standings[0].total_points, 5)
 
-        # Charlie should be #3 with 11 pts
-        self.assertEqual(results[2].user_id, 103)
-        self.assertEqual(results[2].total_points, 11)
-        self.assertEqual(results[2].tiktoks, 2)
-        self.assertEqual(results[2].reactions, 1)
+    async def test_window_excludes_events_outside_the_contest(self):
+        await self.store.record_events(
+            [
+                self._event(101, "before the contest started", "message", -7200, "old"),
+                self._event(101, "after the contest started", "message", 60, "new"),
+            ]
+        )
+        standings = await self.store.aggregate(
+            self.guild_id, NOW, NOW + timedelta(hours=1)
+        )
+        self.assertEqual(standings[0].messages, 1)
+        self.assertEqual(standings[0].total_points, CONTEST_POINTS_MESSAGE)
+
+    async def test_session_lifecycle(self):
+        self.assertIsNone(await self.store.get_active_session(self.guild_id))
+
+        first = await self.store.start_session(
+            guild_id=self.guild_id,
+            name="September Contest",
+            started_at=NOW,
+            started_by_id=7,
+            started_by_name="Aljay",
+        )
+        self.assertTrue(first.is_active)
+        active = await self.store.get_active_session(self.guild_id)
+        self.assertEqual(active.id, first.id)
+
+        # Starting another contest closes the one still running.
+        second = await self.store.start_session(
+            guild_id=self.guild_id,
+            name="October Contest",
+            started_at=NOW + timedelta(days=30),
+            started_by_id=7,
+            started_by_name="Aljay",
+        )
+        self.assertNotEqual(second.id, first.id)
+        active = await self.store.get_active_session(self.guild_id)
+        self.assertEqual(active.id, second.id)
+        self.assertFalse((await self.store.get_session(first.id)).is_active)
+
+        ended = await self.store.end_session(
+            second.id,
+            ended_at=NOW + timedelta(days=60),
+            ended_by_name="Aljay",
+            snapshot={"standings": [], "channels_inspected": 4},
+        )
+        self.assertFalse(ended.is_active)
+        self.assertEqual(ended.snapshot["channels_inspected"], 4)
+        self.assertIsNone(await self.store.get_active_session(self.guild_id))
+
+        history = await self.store.list_sessions(self.guild_id)
+        self.assertEqual([item.id for item in history], [second.id, first.id])
+
+    async def test_reset_wipes_events_and_sessions(self):
+        await self.store.record_events(
+            [self._event(101, "this linen feels incredible", "message", 0, "m1")]
+        )
+        await self.store.start_session(
+            guild_id=self.guild_id,
+            name="Doomed Contest",
+            started_at=NOW,
+            started_by_id=7,
+            started_by_name="Aljay",
+        )
+        events, sessions = await self.store.reset_guild(self.guild_id)
+        self.assertEqual((events, sessions), (1, 1))
+        self.assertIsNone(await self.store.get_active_session(self.guild_id))
+        self.assertEqual(await self.store.list_sessions(self.guild_id), [])
+        self.assertEqual(
+            await self.store.aggregate(
+                self.guild_id, NOW - timedelta(days=1), NOW + timedelta(days=1)
+            ),
+            [],
+        )
 
 
 class TestContestDateRanges(unittest.TestCase):

@@ -27,14 +27,10 @@ from core.announcements import (
     parse_time,
     parse_weekday,
 )
-from core.embed_script import (
-    MAX_IMAGE_URL_LENGTH,
-    EmbedScript,
-    clean_text,
-    normalize_url,
-)
+from core.embed_script import EmbedScript
 from core.embed_templates import TemplateError
 from utils import embed_builder
+from views.banner import BannerModal, describe_banner
 from views.broadcast_view import (
     TEXT_CHANNEL_TYPES,
     EmbedComposerModal,
@@ -250,9 +246,9 @@ def build_screen_embeds(
     card.add_field(
         name=embed_builder.section("Banner image"),
         value=embed_builder.item(
-            f"[Attached image]({script.image_url})"
-            if script.image_url
-            else "*none — add one with* **Banner image**"
+            describe_banner(
+                script, missing="*none — add one with* **Banner image**"
+            )
         ),
         inline=False,
     )
@@ -260,8 +256,10 @@ def build_screen_embeds(
         name=embed_builder.section("Server icon"),
         value=embed_builder.item(
             "Shown in the corner of the embed"
-            if script.show_icon
-            else "Hidden — the banner carries the branding"
+            if script.icon_visible
+            else "Hidden — pictures always post without it"
+            if script.has_image
+            else "Hidden"
         ),
         inline=False,
     )
@@ -303,6 +301,10 @@ async def render_screen(interaction: discord.Interaction, state: ScreenState) ->
         interaction,
         build_screen_embeds(state, interaction.guild),
         AnnouncementScreenView(state),
+        # An uploaded banner rides along with every redraw: the preview embed
+        # points at `attachment://…`, which only resolves while the file is
+        # on the message.
+        attachments=state.script.render_files(),
     )
 
 
@@ -351,6 +353,7 @@ async def open_announcement(
     await interaction.followup.send(
         embeds=build_screen_embeds(state, interaction.guild),
         view=AnnouncementScreenView(state),
+        files=state.script.render_files(),
         ephemeral=True,
     )
 
@@ -364,6 +367,8 @@ class AnnouncementScreenView(discord.ui.View):
         self.icon_toggle.label = (
             "Server icon: ON" if state.script.show_icon else "Server icon: OFF"
         )
+        # A picture always posts without the icon, so the toggle has nothing to do.
+        self.icon_toggle.disabled = state.script.has_image
         self.ping_toggle.label = (
             "Ping @everyone: ON" if state.ping_now else "Ping @everyone: OFF"
         )
@@ -420,7 +425,21 @@ class AnnouncementScreenView(discord.ui.View):
     async def banner_image(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await interaction.response.send_modal(BannerModal(self.state))
+        state = self.state
+
+        async def applied(
+            modal_interaction: discord.Interaction, notice: str, level: str
+        ) -> None:
+            if level in {"error", "warning", "info"}:
+                # Nothing reached the draft, so there is nothing to write back.
+                state.inform(notice, level)
+                await render_screen(modal_interaction, state)
+                return
+            await _persist(modal_interaction, state, success=notice)
+
+        await interaction.response.send_modal(
+            BannerModal(state.script, on_apply=applied)
+        )
 
     @discord.ui.button(label="Server icon: ON", style=discord.ButtonStyle.secondary, emoji="🏷️", row=0)
     async def icon_toggle(
@@ -451,6 +470,7 @@ class AnnouncementScreenView(discord.ui.View):
             interaction,
             build_schedule_embed(self.state),
             AnnouncementScheduleView(self.state),
+            attachments=[],
         )
 
     @discord.ui.button(label="Ping @everyone: OFF", style=discord.ButtonStyle.secondary, row=1)
@@ -481,6 +501,7 @@ class AnnouncementScreenView(discord.ui.View):
                 "team saved are overwritten and cannot be recovered.",
             ),
             ResetConfirmView(self.state),
+            attachments=[],
         )
 
     # ── row 2: navigation ─────────────────────────────────────
@@ -493,6 +514,7 @@ class AnnouncementScreenView(discord.ui.View):
             interaction,
             await build_announcement_hub_embed(interaction),
             AnnouncementHubView(),
+            attachments=[],
         )
 
     async def on_error(
@@ -538,46 +560,6 @@ async def _persist(
 
     await state.reload()
     await render_screen(interaction, state)
-
-
-class BannerModal(discord.ui.Modal, title="Banner image"):
-    """Swaps just the banner, without reopening the whole composer."""
-
-    def __init__(self, state: ScreenState):
-        super().__init__()
-        self.state = state
-        self.url = discord.ui.TextInput(
-            label="Image URL (leave blank to remove)",
-            placeholder="https://... — or blank for no banner",
-            default=state.script.image_url,
-            required=False,
-            max_length=MAX_IMAGE_URL_LENGTH,
-        )
-        self.add_item(self.url)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not await require_manage(interaction):
-            return
-        await ack(interaction)
-        typed = clean_text(self.url.value, MAX_IMAGE_URL_LENGTH)
-        resolved = normalize_url(typed)
-        if typed and resolved is None:
-            self.state.inform(
-                "That link was ignored — Discord only accepts image URLs that "
-                "start with `http://` or `https://`.",
-                "error",
-            )
-            await render_screen(interaction, self.state)
-            return
-
-        self.state.script.image_url = resolved
-        await _persist(
-            interaction,
-            self.state,
-            success=(
-                "Banner updated." if resolved else "Banner removed."
-            ),
-        )
 
 
 class ResetConfirmView(discord.ui.View):
@@ -723,7 +705,10 @@ async def _render_schedule(
         state.guild_id, state.announcement.slug
     )
     await replace_message(
-        interaction, build_schedule_embed(state), AnnouncementScheduleView(state)
+        interaction,
+        build_schedule_embed(state),
+        AnnouncementScheduleView(state),
+        attachments=[],
     )
 
 

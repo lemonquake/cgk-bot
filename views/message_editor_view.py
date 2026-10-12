@@ -15,13 +15,9 @@ import logging
 
 import discord
 
-from core.embed_script import (
-    MAX_IMAGE_URL_LENGTH,
-    EmbedScript,
-    clean_text,
-    normalize_url,
-)
+from core.embed_script import EmbedScript, clean_text, normalize_url
 from utils import embed_builder
+from views.banner import BannerModal, describe_banner
 from views.broadcast_view import EmbedComposerModal, channel_context
 from views.common import ack, replace_message, require_manage
 
@@ -42,6 +38,18 @@ def _stamp_of(message: discord.Message) -> tuple[str | None, object] | None:
     source = message.embeds[0]
     footer_text = source.footer.text if source.footer else None
     return (footer_text, source.timestamp)
+
+
+def _banner_attachment(
+    message: discord.Message, image_url: str | None
+) -> discord.Attachment | None:
+    """The message's own upload that the embed is using as its banner."""
+    if not image_url:
+        return None
+    for attachment in message.attachments:
+        if image_url in {attachment.url, attachment.proxy_url}:
+            return attachment
+    return None
 
 
 def script_from_message(
@@ -89,9 +97,13 @@ def script_from_message(
                 "header when you update."
             )
 
-    if message.attachments:
+    banner = _banner_attachment(message, script.image_url)
+    other_attachments = [
+        attachment for attachment in message.attachments if attachment is not banner
+    ]
+    if other_attachments:
         notes.append(
-            f"**{len(message.attachments)} attachment(s)** stay on the message "
+            f"**{len(other_attachments)} attachment(s)** stay on the message "
             "— editing does not touch uploaded files."
         )
     if message.components:
@@ -117,6 +129,12 @@ class EditorState:
     channels: dict[str, int | None] = field(default_factory=dict)
     # The footer and timestamp the message was originally published with.
     stamp: tuple[str | None, object] | None = None
+    # The upload already on the message that its embed uses as the banner,
+    # and the link that points at it. Keeping both is what lets an untouched
+    # banner survive an edit: the file has to be listed again or Discord
+    # strips it, and the embed would then point at nothing.
+    banner_attachment: discord.Attachment | None = None
+    banner_url: str | None = None
 
     @property
     def changed(self) -> bool:
@@ -128,6 +146,28 @@ class EditorState:
         self.script = script
         self.baseline = script.to_payload()
         self.notes = notes
+        self.banner_attachment = _banner_attachment(self.message, script.image_url)
+        self.banner_url = script.image_url if self.banner_attachment else None
+
+    def attachments_for_update(self) -> list:
+        """
+        The complete file list the edited message should end up with.
+
+        Discord replaces the attachments wholesale, so everything that has to
+        stay - other uploads, and an untouched banner - is listed again here
+        alongside any new banner being uploaded.
+        """
+        keep = [
+            attachment
+            for attachment in self.message.attachments
+            if attachment is not self.banner_attachment
+        ]
+        files = self.script.render_files()
+        if files:
+            return keep + files
+        if self.banner_attachment is not None and self.script.image_url == self.banner_url:
+            return keep + [self.banner_attachment]
+        return keep
 
     def render(self, guild: discord.Guild | None) -> discord.Embed | None:
         """
@@ -138,7 +178,8 @@ class EditorState:
         published.
         """
         embed = self.script.render_embed(guild=guild, channels=self.channels)
-        if embed is not None and self.stamp is not None:
+        # A picture posts without any footer, so there is nothing to restore.
+        if embed is not None and self.stamp is not None and not self.script.has_image:
             footer_text, timestamp = self.stamp
             if footer_text:
                 embed.set_footer(text=footer_text)
@@ -199,7 +240,9 @@ def build_editor_embeds(
         name=embed_builder.section("Server icon"),
         value=embed_builder.item(
             "Shown in the corner of the embed"
-            if script.show_icon
+            if script.icon_visible
+            else "Hidden — pictures always post without it"
+            if script.has_image
             else "Hidden"
         ),
         inline=False,
@@ -207,9 +250,7 @@ def build_editor_embeds(
     card.add_field(
         name=embed_builder.section("Banner image"),
         value=embed_builder.item(
-            f"[Attached image]({script.image_url})"
-            if script.image_url
-            else "*none — add one with* **Banner image**"
+            describe_banner(script, missing="*none — add one with* **Banner image**")
         ),
         inline=False,
     )
@@ -243,6 +284,9 @@ async def render_editor(interaction: discord.Interaction, state: EditorState) ->
         interaction,
         build_editor_embeds(state, interaction.guild),
         MessageEditorView(state),
+        # A staged upload rides along with every redraw: the preview points at
+        # `attachment://…`, which only resolves while the file is attached.
+        attachments=state.script.render_files(),
     )
 
 
@@ -303,6 +347,7 @@ async def open_message_editor(
     await interaction.followup.send(
         embeds=build_editor_embeds(state, interaction.guild),
         view=MessageEditorView(state),
+        files=state.script.render_files(),
         ephemeral=True,
     )
 
@@ -316,6 +361,8 @@ class MessageEditorView(discord.ui.View):
         self.icon_toggle.label = (
             "Server icon: ON" if state.script.show_icon else "Server icon: OFF"
         )
+        # A picture always posts without the icon, so the toggle has nothing to do.
+        self.icon_toggle.disabled = state.script.has_image
         self.update_message.disabled = not state.changed
         self.discard.disabled = not state.changed
 
@@ -359,7 +406,17 @@ class MessageEditorView(discord.ui.View):
     async def banner_image(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await interaction.response.send_modal(BannerModal(self.state))
+        state = self.state
+
+        async def applied(
+            modal_interaction: discord.Interaction, notice: str, level: str
+        ) -> None:
+            state.inform(notice, level)
+            await render_editor(modal_interaction, state)
+
+        await interaction.response.send_modal(
+            BannerModal(state.script, on_apply=applied)
+        )
 
     @discord.ui.button(label="Server icon: ON", style=discord.ButtonStyle.secondary, emoji="🏷️", row=0)
     async def icon_toggle(
@@ -401,6 +458,10 @@ class MessageEditorView(discord.ui.View):
             edited = await state.message.edit(
                 content=content,
                 embed=embed,
+                # Discord replaces the file list wholesale on an edit, so the
+                # banner - new or untouched - has to be listed again or the
+                # embed ends up pointing at an upload that is no longer there.
+                attachments=state.attachments_for_update(),
                 # An edit never re-notifies for mentions that were already
                 # there, and this stops a newly typed @everyone from pinging
                 # the server a second time.
@@ -506,42 +567,6 @@ class MessageEditorView(discord.ui.View):
             await render_editor(interaction, self.state)
         except discord.HTTPException:
             logger.warning("Could not report an editor failure", exc_info=True)
-
-
-class BannerModal(discord.ui.Modal, title="Banner image"):
-    """Swaps the embed image without reopening the whole composer."""
-
-    def __init__(self, state: EditorState):
-        super().__init__()
-        self.state = state
-        self.url = discord.ui.TextInput(
-            label="Image URL (leave blank to remove)",
-            placeholder="https://... — or blank for no banner",
-            default=state.script.image_url,
-            required=False,
-            max_length=MAX_IMAGE_URL_LENGTH,
-        )
-        self.add_item(self.url)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not await require_manage(interaction):
-            return
-        await ack(interaction)
-        typed = clean_text(self.url.value, MAX_IMAGE_URL_LENGTH)
-        resolved = normalize_url(typed)
-        if typed and resolved is None:
-            self.state.inform(
-                "That link was ignored — Discord only accepts image URLs that "
-                "start with `http://` or `https://`.",
-                "error",
-            )
-        else:
-            self.state.script.image_url = resolved
-            self.state.inform(
-                "Banner staged." if resolved else "Banner removed from the draft.",
-                "success",
-            )
-        await render_editor(interaction, self.state)
 
 
 __all__ = [

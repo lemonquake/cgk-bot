@@ -154,6 +154,9 @@ class EngagementRangeSelect(discord.ui.Select):
                     label="Past 7 days", value="week", emoji="🗓️", description="Last 7 days"
                 ),
                 discord.SelectOption(
+                    label="Past 14 days", value="fortnight", emoji="📆", description="Last 14 days"
+                ),
+                discord.SelectOption(
                     label="Past 1 month", value="month", emoji="📊", description="Last 30 days"
                 ),
                 discord.SelectOption(
@@ -177,6 +180,7 @@ class EngagementRangeSelect(discord.ui.Select):
         days, label = {
             "day": (1, "Past 1 day"),
             "week": (7, "Past 7 days"),
+            "fortnight": (14, "Past 14 days"),
             "month": (30, "Past 1 month (30 days)"),
         }[selection]
         end = datetime.now(timezone.utc)

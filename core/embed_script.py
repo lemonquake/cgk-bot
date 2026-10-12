@@ -10,11 +10,13 @@ messages) passes through `resolve_text` so live placeholders such as
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import discord
 
 from config import BRAND_NAME, COLOR_BRAND
+from core import images
 from utils import embed_builder
 
 # Documented placeholders, shown to moderators inside the composer modals.
@@ -26,7 +28,8 @@ PLACEHOLDER_HELP = (
 
 # Payload schema version. Stored with every saved template and draft so an
 # older row can still be recognised (and migrated) by a future build.
-PAYLOAD_VERSION = 2
+# 3 added `image_asset`: a banner uploaded to the bot rather than linked.
+PAYLOAD_VERSION = 3
 
 # Field ceilings, kept a little under Discord's own limits.
 MAX_CONTENT_LENGTH = 1900
@@ -126,6 +129,12 @@ class EmbedScript:
         self.content: Optional[str] = None
         self.title: Optional[str] = None
         self.description: Optional[str] = None
+        # A banner is held one of two ways. `image_asset` is a picture stored
+        # in the bot's own asset folder, which posts as an upload the embed
+        # points at; `image_url` is a plain link Discord fetches itself. The
+        # upload always wins, because a link can expire out from under a
+        # saved template.
+        self.image_asset: Optional[str] = None
         self.image_url: Optional[str] = None
         self.color: int = COLOR_BRAND
         # The server icon in the embed's top-right corner. On by default so
@@ -140,11 +149,53 @@ class EmbedScript:
     @property
     def is_blank(self) -> bool:
         """True while there is nothing worth previewing, saving or sending."""
-        return not (self.content or self.title or self.description or self.image_url)
+        return not (self.content or self.title or self.description or self.has_image)
 
     @property
     def has_embed(self) -> bool:
-        return bool(self.title or self.description or self.image_url)
+        return bool(self.title or self.description or self.has_image)
+
+    @property
+    def has_image(self) -> bool:
+        return bool(self.image_asset or self.image_url)
+
+    # ── the banner ────────────────────────────────────────────
+    def set_image_upload(self, asset_id: str) -> None:
+        """Points the banner at a stored upload, dropping any link it had."""
+        self.image_asset = asset_id
+        self.image_url = None
+
+    def set_image_link(self, url: Optional[str]) -> None:
+        """Points the banner at a link, dropping any upload it had."""
+        self.image_url = url
+        self.image_asset = None
+
+    def clear_image(self) -> None:
+        self.image_asset = None
+        self.image_url = None
+
+    def resolve_image(self) -> tuple[Optional[str], Optional[Path]]:
+        """
+        The banner as Discord needs it: `(url for the embed, file to attach)`.
+
+        Both halves are decided in one place so they can never disagree. An
+        embed pointing at `attachment://…` with no matching upload is rejected
+        outright by Discord, and an upload the embed never names lands under
+        the message as a download instead of showing as the picture.
+        """
+        path = images.path_for(self.image_asset)
+        if path is not None:
+            return images.reference(path.name), path
+        # The stored asset is gone (a wiped data folder, a restore from an
+        # older backup): fall back to the link rather than breaking the post.
+        if self.image_url:
+            return self.image_url, None
+        return None, None
+
+    def render_files(self) -> list[discord.File]:
+        """Fresh upload handles for the banner - a `File` is spent when sent."""
+        _, path = self.resolve_image()
+        return [discord.File(path, filename=path.name)] if path is not None else []
 
     # ── rendering ─────────────────────────────────────────────
     def render_embed(
@@ -169,16 +220,36 @@ class EmbedScript:
                 return value
             return resolve_text(value, guild=guild, channels=channels)
 
+        image_url, image_path = self.resolve_image()
+        if image_url:
+            if image_path is not None and not (self.title or self.description):
+                # An uploaded picture on its own posts as the picture itself:
+                # full size, with no embed frame around it. The file already
+                # travels with the message through `render_files`.
+                return None
+            # A picture is shown clean - no server icon in the corner and no
+            # bot footer or timestamp under it.
+            embed = discord.Embed(
+                title=text(self.title),
+                description=text(self.description),
+                color=self.color,
+            )
+            embed.set_image(url=image_url)
+            return embed
+
         embed = embed_builder.base_embed(
             title=text(self.title),
             description=text(self.description),
             color=self.color,
         )
-        if self.image_url:
-            embed.set_image(url=self.image_url)
         if self.show_icon and guild and guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
         return embed
+
+    @property
+    def icon_visible(self) -> bool:
+        """Whether the server icon actually appears on the posted message."""
+        return self.show_icon and not self.has_image
 
     def render_content(
         self,
@@ -201,6 +272,7 @@ class EmbedScript:
             "content": self.content,
             "title": self.title,
             "description": self.description,
+            "image_asset": self.image_asset,
             "image_url": self.image_url,
             "color": self.color,
             "show_icon": self.show_icon,
@@ -219,6 +291,10 @@ class EmbedScript:
         self.description = clean_text(
             payload.get("description"), MAX_DESCRIPTION_LENGTH
         )
+        # A stored row never gets to name a file on disk: anything that is not
+        # a well-formed asset id is dropped, and the link beside it is used.
+        stored_asset = payload.get("image_asset")
+        self.image_asset = stored_asset if images.is_asset_id(stored_asset) else None
         self.image_url = normalize_url(payload.get("image_url"))
         self.color = normalize_color(payload.get("color"))
         # Templates saved before the icon became a choice have no key at all,

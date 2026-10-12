@@ -1,10 +1,13 @@
 """
-Embed and plain-text broadcast composer for the CGK Linens Mod Panel.
+Embed broadcast composer for the CGK Linens Mod Panel.
 Created by Aljay Leodones for CGK Linens.
 
 The composer modal edits an `EmbedScript` in place, which lets the Embed Studio
 (see `views/embed_studio_view.py`) reopen it pre-filled, save it as a template
 and publish it, all from the same draft.
+
+Plain, embed-free posts have their own composer in
+`views/plain_message_view.py`.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from typing import Awaitable, Callable, Optional
 
 import discord
 
+from core import images
 from core.embed_script import (
     MAX_CONTENT_LENGTH,
     MAX_DESCRIPTION_LENGTH,
@@ -103,6 +107,7 @@ class BroadcastPreviewView(discord.ui.View):
         await interaction.response.edit_message(
             embed=embed_builder.info_embed("Cancelled", "Nothing was published."),
             view=None,
+            attachments=[],
         )
         self.stop()
 
@@ -129,6 +134,10 @@ class BroadcastPreviewView(discord.ui.View):
             message = await channel.send(
                 content=content,
                 embed=embed,
+                # An uploaded banner is sent with the message and named by the
+                # embed; without the file it would be a broken reference, and
+                # without the reference a download card under the post.
+                files=self.script.render_files(),
                 allowed_mentions=discord.AllowedMentions(
                     users=True, roles=True, everyone=self.mention_everyone
                 ),
@@ -138,8 +147,8 @@ class BroadcastPreviewView(discord.ui.View):
                 interaction,
                 embed_builder.error_embed(
                     "Missing permissions",
-                    "The bot needs **View Channel**, **Send Messages** and "
-                    f"**Embed Links** in {channel.mention}.",
+                    "The bot needs **View Channel**, **Send Messages**, "
+                    f"**Embed Links** and **Attach Files** in {channel.mention}.",
                 ),
             )
             return
@@ -189,7 +198,9 @@ class BroadcastPreviewView(discord.ui.View):
     ) -> None:
         """Reports the outcome on the preview and retires the controls."""
         try:
-            await replace_message(interaction, embed, view=None)
+            # The preview's banner upload goes with it - the outcome card has
+            # no picture, and a leftover file would sit under it.
+            await replace_message(interaction, embed, view=None, attachments=[])
         except discord.HTTPException:
             # The preview was dismissed while the message was on its way out;
             # the publish itself already succeeded or failed on its own merits.
@@ -234,6 +245,7 @@ async def show_preview(
     await interaction.followup.send(
         content=content,
         embeds=embeds,
+        files=script.render_files(),
         view=BroadcastPreviewView(script, mention_everyone=mention_everyone),
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
@@ -281,9 +293,13 @@ class EmbedComposerModal(discord.ui.Modal, title="Embed Message"):
             max_length=MAX_CONTENT_LENGTH,
             required=False,
         )
+        # Deliberately not a way to *remove* the banner: an uploaded one
+        # cannot be shown in a text box, so a blank field means "leave it
+        # alone" rather than silently deleting a picture the moderator cannot
+        # see. Removing is what the Banner image screen is for.
         self.image_url = discord.ui.TextInput(
-            label="Image URL (optional)",
-            placeholder="https://...",
+            label="Image link — blank keeps the banner",
+            placeholder="Use the 🖼️ Banner image button to upload or remove one",
             default=self.script.image_url,
             required=False,
             max_length=MAX_IMAGE_URL_LENGTH,
@@ -306,31 +322,27 @@ class EmbedComposerModal(discord.ui.Modal, title="Embed Message"):
         description = clean_text(self.body.value, MAX_DESCRIPTION_LENGTH)
         lead = clean_text(self.lead.value, MAX_CONTENT_LENGTH)
         typed_image = clean_text(self.image_url.value, MAX_IMAGE_URL_LENGTH)
-        image = normalize_url(typed_image)
 
-        if not (title or description or lead or image):
+        if not (title or description or lead or typed_image or self.script.has_image):
             await interaction.response.send_message(
                 embed=embed_builder.error_embed(
                     "Nothing to send",
                     "Fill in at least a title, a message, a line above the "
-                    "embed or an image URL.",
+                    "embed or a banner image.",
                 ),
                 ephemeral=True,
             )
             return
 
-        notes: list[str] = []
-        if typed_image and image is None:
-            notes.append(
-                "The image URL was ignored — Discord only accepts links that "
-                "start with `http://` or `https://`."
-            )
+        # Storing a newly typed link means downloading it, which outruns the
+        # three-second reply window the modal is answered in.
+        await interaction.response.defer()
+        notes = await self._apply_image(typed_image)
 
         self.script.user_id = interaction.user.id
         self.script.title = title
         self.script.description = description
         self.script.content = lead
-        self.script.image_url = image
         self.script.color = normalize_color(self.color.value)
 
         if self._on_apply is not None:
@@ -338,19 +350,31 @@ class EmbedComposerModal(discord.ui.Modal, title="Embed Message"):
             return
         await show_preview(interaction, self.script, notes=notes)
 
+    async def _apply_image(self, typed: Optional[str]) -> list[str]:
+        """
+        Applies whatever is in the image box, reporting anything it could not.
 
-class PlainMessageModal(discord.ui.Modal, title="Plain Message"):
-    body = discord.ui.TextInput(
-        label="Message",
-        style=discord.TextStyle.paragraph,
-        placeholder=PLACEHOLDER_HINT,
-        max_length=MAX_CONTENT_LENGTH,
-        required=True,
-    )
+        A link that is already the draft's banner is left alone, so editing a
+        title does not re-download the picture every time.
+        """
+        if not typed or typed == self.script.image_url:
+            return []
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not await require_manage(interaction):
-            return
-        script = EmbedScript(interaction.user.id)
-        script.content = clean_text(self.body.value, MAX_CONTENT_LENGTH)
-        await show_preview(interaction, script)
+        url = normalize_url(typed)
+        if url is None:
+            return [
+                "The image link was ignored — Discord only accepts links "
+                "that start with `http://` or `https://`. The banner is "
+                "unchanged."
+            ]
+        try:
+            picture = await images.load_from_url(url)
+        except images.ImageRejected as exc:
+            return [
+                f"The image link was not used — {exc.reason} The banner is "
+                "unchanged; **Banner image** can upload the file directly."
+            ]
+        # Copied rather than linked, so the banner survives the link expiring
+        # and is checked here instead of failing in front of the server.
+        self.script.set_image_upload(images.store(picture))
+        return []

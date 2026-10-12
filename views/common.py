@@ -73,15 +73,26 @@ async def replace_message(
     interaction: discord.Interaction,
     embed: discord.Embed | list[discord.Embed],
     view: discord.ui.View | None = None,
+    attachments: list[discord.File] | None = None,
 ) -> None:
     """
     Swaps the message behind a control, deferred or not.
 
     Takes one embed or a list of them, so a screen can pair its own card with
     a live render of whatever the moderator is composing.
+
+    `attachments` is the full set of files the message should carry once the
+    edit lands - an uploaded banner has to be re-sent on every redraw, because
+    an embed pointing at `attachment://…` is only valid while the file it
+    names is actually on the message. `None` leaves whatever is there alone.
     """
     embeds = list(embed) if isinstance(embed, list) else [embed]
+    files = discord.utils.MISSING if attachments is None else attachments
     if interaction.response.is_done():
-        await interaction.edit_original_response(embeds=embeds, view=view)
+        await interaction.edit_original_response(
+            embeds=embeds, view=view, attachments=files
+        )
     else:
-        await interaction.response.edit_message(embeds=embeds, view=view)
+        await interaction.response.edit_message(
+            embeds=embeds, view=view, attachments=files
+        )

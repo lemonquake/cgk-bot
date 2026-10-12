@@ -16,6 +16,14 @@ from config import (
     GUILD_ID,
 )
 from views.announcement_view import AnnouncementHubView
+from views.cgk_onboarding_view import CGKOnboardingHubView
+from views.creator_onboarding_view import (
+    CreatorJourneyView,
+    CreatorOnboardingHubView,
+    CreatorQuestionnaireView,
+    CreatorWelcomeView,
+    Shop101DoneView,
+)
 from views.member_report_view import MemberReportHubView
 from views.mod_panel_view import ModPanelView
 from views.onboarding_view import OnboardingHubView
@@ -32,6 +40,9 @@ EXTENSIONS = (
     "cogs.engagement",
     "cogs.engagement_contest",
     "cogs.onboarding",
+    "cogs.creator_onboarding",
+    "cogs.cgk_onboarding",
+    "cogs.questionnaire",
     "cogs.memberreport",
     "cogs.announcements",
     "cogs.message_editor",
@@ -61,6 +72,14 @@ class CGKBot(commands.Bot):
         # Static custom_ids keep every panel button alive across restarts.
         self.add_view(ModPanelView())
         self.add_view(OnboardingHubView())
+        self.add_view(CreatorOnboardingHubView())
+        self.add_view(CGKOnboardingHubView())
+        # Member-facing creator buttons, shared by the public Onboarding post
+        # and every private CGK onboarding channel.
+        self.add_view(CreatorWelcomeView())
+        self.add_view(CreatorJourneyView())
+        self.add_view(Shop101DoneView())
+        self.add_view(CreatorQuestionnaireView())
         self.add_view(MemberReportHubView())
         self.add_view(AnnouncementHubView())
 

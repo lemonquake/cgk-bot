@@ -1,6 +1,14 @@
 """
 Member onboarding engine: scan, welcome post, warm DM and onboarding log.
 Created by Aljay Leodones for CGK Linens.
+
+Everything a moderator can change lives in `guild_settings`, so it survives
+restarts and never needs a `.env` edit:
+
+▸ the **default welcome channel** - where the public post goes unless a
+  different channel is picked for that send,
+▸ the **start-here** and **introductions** channels the welcome links to,
+▸ the **saved welcome message** used as the starting draft every time.
 """
 
 from __future__ import annotations
@@ -9,6 +17,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import logging
+from typing import Awaitable, Callable, Optional
 
 import discord
 from discord.ext import commands
@@ -22,29 +31,36 @@ from config import (
     WELCOME_CHANNEL_ID,
 )
 from core.database import get_database
-from core.embed_script import resolve_text
+from core.embed_script import clean_text, resolve_text
 from utils import embed_builder
 
 logger = logging.getLogger("cgk_bot.onboarding")
 
-# Setting keys stored per guild in `guild_settings`
+# Setting keys stored per guild in `guild_settings`. The channel keys are also
+# the placeholder names (`{welcome_channel}` ...), so they must not change.
 CHANNEL_SETTINGS = {
     "welcome": "welcome_channel_id",
     "onboarding": "onboarding_channel_id",
     "introductions": "introductions_channel_id",
 }
 CHANNEL_LABELS = {
-    "welcome": "Welcome / announcements",
-    "onboarding": "Start here (onboarding)",
-    "introductions": "Introductions",
+    "welcome": "Default welcome channel",
+    "onboarding": "Start-here channel",
+    "introductions": "Introductions channel",
+}
+CHANNEL_HINTS = {
+    "welcome": "Pre-selected for every welcome post (you can still pick another).",
+    "onboarding": "Linked in the welcome post and DM as the place to start.",
+    "introductions": "Linked in the welcome post and DM for saying hello.",
 }
 ENV_CHANNEL_DEFAULTS = {
     "welcome": WELCOME_CHANNEL_ID,
     "onboarding": ONBOARDING_CHANNEL_ID,
     "introductions": INTRODUCTIONS_CHANNEL_ID,
 }
+MESSAGE_SETTING = "onboarding_welcome_message"
 
-# Default, fully editable welcome post. Placeholders are hydrated on send.
+# Built-in welcome post, used until a moderator saves their own.
 DEFAULT_MESSAGE = (
     "\U0001F44B **Please give a warm welcome to our newest members!**\n\n"
     "Welcome to the **CGK Linens** community — we're thrilled to have you here! \U0001F389\n\n"
@@ -57,6 +73,34 @@ DEFAULT_MESSAGE = (
 )
 
 MAX_MESSAGE_LENGTH = 1900
+# The editable body, leaving room in the first post for the member tags.
+MAX_BODY_LENGTH = 1800
+
+# Delivery modes: (label, emoji, description). Order is the menu order.
+DELIVERY_MODES: dict[str, tuple[str, str, str]] = {
+    "post_dm": (
+        "Post + warm DM",
+        "📣",
+        "Tag everyone in one post, then DM each member",
+    ),
+    "post": ("Post only", "📢", "Tag everyone in one post, no DMs"),
+    "dm": ("Warm DM only", "✉️", "No public post, just the DM"),
+}
+DEFAULT_MODE = "post_dm"
+
+DM_PACE_SECONDS = 1.0
+PROGRESS_EVERY = 10
+
+ProgressCallback = Callable[[int, int], Awaitable[None]]
+PostChannel = discord.TextChannel | discord.Thread
+
+
+def mode_posts(mode: str) -> bool:
+    return mode in ("post_dm", "post")
+
+
+def mode_dms(mode: str) -> bool:
+    return mode in ("post_dm", "dm")
 
 
 @dataclass(slots=True)
@@ -70,8 +114,24 @@ class DayGroup:
 
 
 @dataclass(slots=True)
+class OnboardingSettings:
+    """Everything a screen needs, read in a single query."""
+
+    channels: dict[str, int | None]
+    # Where each channel came from: "saved" (Mod Panel), "env" or "unset".
+    sources: dict[str, str]
+    message: str
+    custom_message: bool
+
+    @property
+    def default_channel_id(self) -> int | None:
+        return self.channels.get("welcome")
+
+
+@dataclass(slots=True)
 class DeliveryResult:
-    posted_channel: discord.abc.GuildChannel | None = None
+    posted_channel: PostChannel | None = None
+    jump_url: str | None = None
     dm_success: int = 0
     dm_failed: int = 0
     failed_names: list[str] = field(default_factory=list)
@@ -123,6 +183,72 @@ def _bucket_order(key: str) -> tuple[int, int]:
     return (1, int(key[1:]))
 
 
+def missing_permissions(channel: PostChannel, member: discord.Member) -> list[str]:
+    """Permissions the bot lacks to post the welcome in `channel`."""
+    permissions = channel.permissions_for(member)
+    needed = [("view_channel", "View Channel")]
+    if isinstance(channel, discord.Thread):
+        needed.append(("send_messages_in_threads", "Send Messages in Threads"))
+    else:
+        needed.append(("send_messages", "Send Messages"))
+    return [label for attr, label in needed if not getattr(permissions, attr, False)]
+
+
+async def resolve_post_channel(
+    guild: discord.Guild, channel_id: int | None
+) -> PostChannel | None:
+    """The postable channel behind an id, or `None` if it is gone."""
+    if not channel_id:
+        return None
+    channel = guild.get_channel_or_thread(channel_id)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+    return channel if isinstance(channel, (discord.TextChannel, discord.Thread)) else None
+
+
+async def recent_members(
+    guild: discord.Guild, exclude_ids: set[int]
+) -> list[discord.Member]:
+    """Non-bot members who joined in the lookback window, newest first."""
+    if not guild.chunked:
+        # Without a full member list the scan silently misses people.
+        try:
+            await guild.chunk(cache=True)
+        except (discord.HTTPException, asyncio.TimeoutError):
+            logger.warning("Could not load the full member list for %s", guild.id)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=ONBOARDING_LOOKBACK_DAYS)
+    pending = [
+        member
+        for member in guild.members
+        if not member.bot
+        and member.joined_at is not None
+        and member.joined_at.astimezone(timezone.utc) >= cutoff
+        and member.id not in exclude_ids
+    ]
+    pending.sort(key=lambda member: member.joined_at, reverse=True)
+    return pending
+
+
+def group_by_day(members: list[discord.Member]) -> list[DayGroup]:
+    """Buckets members by how long ago they joined."""
+    now = datetime.now(timezone.utc)
+    groups: dict[str, DayGroup] = {}
+    for member in members:
+        days_ago = max((now - member.joined_at.astimezone(timezone.utc)).days, 0)
+        key, label, description = _bucket_for(days_ago)
+        group = groups.get(key)
+        if group is None:
+            group = DayGroup(key=key, label=label, description=description)
+            groups[key] = group
+        group.members.append(member)
+
+    return [groups[key] for key in sorted(groups, key=_bucket_order)]
+
+
 class OnboardingCog(commands.Cog, name="OnboardingCog"):
     """Scans for un-welcomed members and delivers branded onboarding messages."""
 
@@ -134,25 +260,52 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         await self.db.initialize()
         logger.info("Onboarding ready (lookback: %s days)", ONBOARDING_LOOKBACK_DAYS)
 
-    # -- channel configuration ---------------------------------
-    async def channel_ids(self, guild_id: int) -> dict[str, int | None]:
-        """Saved channel choices, falling back to the .env defaults."""
+    # -- settings ----------------------------------------------
+    async def settings(self, guild_id: int) -> OnboardingSettings:
+        """Channels and saved message together, in one round trip."""
         stored = await self.db.get_settings(
-            guild_id, list(CHANNEL_SETTINGS.values())
+            guild_id, [*CHANNEL_SETTINGS.values(), MESSAGE_SETTING]
         )
-        resolved: dict[str, int | None] = {}
+        channels: dict[str, int | None] = {}
+        sources: dict[str, str] = {}
         for key, setting in CHANNEL_SETTINGS.items():
             value = stored.get(setting)
             if value and value.isdigit():
-                resolved[key] = int(value)
+                channels[key], sources[key] = int(value), "saved"
+            elif ENV_CHANNEL_DEFAULTS[key]:
+                channels[key], sources[key] = ENV_CHANNEL_DEFAULTS[key], "env"
             else:
-                resolved[key] = ENV_CHANNEL_DEFAULTS[key]
-        return resolved
+                channels[key], sources[key] = None, "unset"
+
+        saved = clean_text(stored.get(MESSAGE_SETTING), MAX_BODY_LENGTH)
+        return OnboardingSettings(
+            channels=channels,
+            sources=sources,
+            message=saved or DEFAULT_MESSAGE,
+            custom_message=bool(saved),
+        )
+
+    async def channel_ids(self, guild_id: int) -> dict[str, int | None]:
+        """Saved channel choices, falling back to the .env defaults."""
+        return (await self.settings(guild_id)).channels
 
     async def set_channel(self, guild_id: int, key: str, channel_id: int | None) -> None:
         await self.db.set_setting(
             guild_id, CHANNEL_SETTINGS[key], str(channel_id) if channel_id else None
         )
+
+    async def save_message(self, guild_id: int, message: str | None) -> None:
+        """Saves the default welcome text; `None` restores the built-in one."""
+        text = clean_text(message, MAX_BODY_LENGTH)
+        if text == DEFAULT_MESSAGE:
+            text = None
+        await self.db.set_setting(guild_id, MESSAGE_SETTING, text)
+
+    async def resolve_channel(
+        self, guild: discord.Guild, channel_id: int | None
+    ) -> PostChannel | None:
+        """The postable channel behind an id, or `None` if it is gone."""
+        return await resolve_post_channel(guild, channel_id)
 
     # -- onboarding log ----------------------------------------
     async def onboarded_ids(self, guild_id: int) -> set[int]:
@@ -196,54 +349,29 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         return row["total"] if row else 0
 
     async def onboarding_stats(self, guild: discord.Guild) -> dict[str, int]:
-        total_row = await self.db.fetchone(
-            "SELECT COUNT(*) AS total FROM onboarded_members WHERE guild_id = ?",
-            (guild.id,),
-        )
-        recent_row = await self.db.fetchone(
+        row = await self.db.fetchone(
             """
-            SELECT COUNT(*) AS recent FROM onboarded_members
-            WHERE guild_id = ? AND onboarded_at >= datetime('now', '-7 days')
+            SELECT COUNT(*) AS total,
+                   SUM(onboarded_at >= datetime('now', '-7 days')) AS recent
+            FROM onboarded_members WHERE guild_id = ?
             """,
             (guild.id,),
         )
         pending = await self.pending_members(guild)
         return {
-            "total": total_row["total"] if total_row else 0,
-            "last_7_days": recent_row["recent"] if recent_row else 0,
+            "total": (row["total"] if row else 0) or 0,
+            "last_7_days": (row["recent"] if row else 0) or 0,
             "pending": len(pending),
         }
 
     # -- scanning ----------------------------------------------
     async def pending_members(self, guild: discord.Guild) -> list[discord.Member]:
         """Non-bot members who joined recently and were never welcomed."""
-        already = await self.onboarded_ids(guild.id)
-        cutoff = datetime.now(timezone.utc) - timedelta(days=ONBOARDING_LOOKBACK_DAYS)
-        pending = [
-            member
-            for member in guild.members
-            if not member.bot
-            and member.joined_at is not None
-            and member.joined_at.astimezone(timezone.utc) >= cutoff
-            and member.id not in already
-        ]
-        pending.sort(key=lambda member: member.joined_at, reverse=True)
-        return pending
+        return await recent_members(guild, await self.onboarded_ids(guild.id))
 
     def group_by_day(self, members: list[discord.Member]) -> list[DayGroup]:
         """Buckets pending members by how long ago they joined."""
-        now = datetime.now(timezone.utc)
-        groups: dict[str, DayGroup] = {}
-        for member in members:
-            days_ago = max((now - member.joined_at.astimezone(timezone.utc)).days, 0)
-            key, label, description = _bucket_for(days_ago)
-            group = groups.get(key)
-            if group is None:
-                group = DayGroup(key=key, label=label, description=description)
-                groups[key] = group
-            group.members.append(member)
-
-        return [groups[key] for key in sorted(groups, key=_bucket_order)]
+        return group_by_day(members)
 
     # -- delivery ----------------------------------------------
     def build_welcome_dm(
@@ -252,7 +380,7 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         """Warm DM embed using deep-links so the channels open from a DM."""
         guild = member.guild
         onboarding_link = embed_builder.channel_reference(
-            guild.id, channels.get("onboarding"), "onboarding"
+            guild.id, channels.get("onboarding"), "start-here"
         )
         intros_link = embed_builder.channel_reference(
             guild.id, channels.get("introductions"), "introductions"
@@ -279,30 +407,42 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         return embed
 
     async def dm_welcome(
-        self, members: list[discord.Member], channels: dict[str, int | None]
-    ) -> tuple[int, int, list[str]]:
-        """Sends the warm DM to each member, paced for Discord's rate limits."""
-        success, failed, failed_names = 0, 0, []
-        for member in members:
+        self,
+        members: list[discord.Member],
+        channels: dict[str, int | None],
+        progress: Optional[ProgressCallback] = None,
+    ) -> tuple[list[discord.Member], list[discord.Member]]:
+        """DMs each member, paced for rate limits. Returns (delivered, failed)."""
+        delivered: list[discord.Member] = []
+        failed: list[discord.Member] = []
+        total = len(members)
+        for index, member in enumerate(members, start=1):
             try:
                 await member.send(embed=self.build_welcome_dm(member, channels))
-                success += 1
+                delivered.append(member)
             except (discord.Forbidden, discord.HTTPException):
-                failed += 1
-                if len(failed_names) < 15:
-                    failed_names.append(member.display_name)
-            await asyncio.sleep(1)  # Rate limit protection
-        return success, failed, failed_names
+                failed.append(member)
+            if progress is not None and index % PROGRESS_EVERY == 0 and index < total:
+                try:
+                    await progress(index, total)
+                except discord.HTTPException:
+                    progress = None  # The token expired; keep sending regardless.
+            if index < total:
+                await asyncio.sleep(DM_PACE_SECONDS)
+        return delivered, failed
 
     async def post_welcome(
         self,
-        channel: discord.TextChannel | discord.Thread,
+        channel: PostChannel,
         members: list[discord.Member],
         message: str,
         channels: dict[str, int | None],
     ) -> discord.Message:
         """Publishes the welcome post, tagging every selected member."""
-        body = resolve_text(message, guild=channel.guild, channels=channels) or DEFAULT_MESSAGE
+        body = resolve_text(message, guild=channel.guild, channels=channels) or ""
+        body = body.strip() or (
+            resolve_text(DEFAULT_MESSAGE, guild=channel.guild, channels=channels) or ""
+        )
         allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
         mentions = [member.mention for member in members]
 
@@ -324,9 +464,10 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
             overflow = _chunk_mentions(mentions, overflow_budget, overflow_budget)
 
         for extra in overflow:
-            await channel.send(
-                content=f"…and also welcoming: {extra}", allowed_mentions=allowed
-            )
+            if extra:
+                await channel.send(
+                    content=f"…and also welcoming: {extra}", allowed_mentions=allowed
+                )
         return primary
 
     async def deliver(
@@ -336,34 +477,48 @@ class OnboardingCog(commands.Cog, name="OnboardingCog"):
         members: list[discord.Member],
         message: str,
         moderator: discord.Member | discord.User,
-        channel: discord.TextChannel | discord.Thread | None,
-        send_dm: bool,
+        channel: PostChannel | None,
+        mode: str,
+        channels: dict[str, int | None] | None = None,
+        progress: Optional[ProgressCallback] = None,
     ) -> DeliveryResult:
         """Runs the full delivery chain: public post, warm DMs, onboarding log."""
-        channels = await self.channel_ids(guild.id)
+        if mode not in DELIVERY_MODES:
+            raise ValueError(f"Unknown delivery mode: {mode}")
+        if mode_posts(mode) and channel is None:
+            raise ValueError("A channel is required to post the welcome.")
+        if channels is None:
+            channels = await self.channel_ids(guild.id)
         result = DeliveryResult()
 
-        if channel is not None:
-            await self.post_welcome(channel, members, message, channels)
+        if mode_posts(mode):
+            primary = await self.post_welcome(channel, members, message, channels)
             result.posted_channel = channel
+            result.jump_url = primary.jump_url
 
-        if send_dm:
-            success, failed, names = await self.dm_welcome(members, channels)
-            result.dm_success = success
-            result.dm_failed = failed
-            result.failed_names = names
+        welcomed = members
+        if mode_dms(mode):
+            delivered, failed = await self.dm_welcome(members, channels, progress)
+            result.dm_success = len(delivered)
+            result.dm_failed = len(failed)
+            result.failed_names = [member.display_name for member in failed[:15]]
+            if not mode_posts(mode):
+                # With no public post, a member whose DMs are closed was never
+                # actually welcomed - leave them in the next scan.
+                welcomed = delivered
 
         result.marked = await self.mark_onboarded(
             guild.id,
-            [member.id for member in members],
+            [member.id for member in welcomed],
             moderator_id=moderator.id,
-            method="panel" if channel else "dm-only",
+            method="dm-only" if mode == "dm" else "panel",
         )
         logger.info(
-            "Onboarded %s member(s) in guild %s (post: %s, DMs: %s ok / %s failed)",
+            "Onboarded %s member(s) in guild %s (mode: %s, post: %s, DMs: %s ok / %s failed)",
             result.marked,
             guild.id,
-            bool(channel),
+            mode,
+            getattr(channel, "id", None),
             result.dm_success,
             result.dm_failed,
         )

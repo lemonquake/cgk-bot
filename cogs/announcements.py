@@ -97,6 +97,9 @@ class AnnouncementCog(commands.Cog, name="AnnouncementCog"):
             message = await channel.send(
                 content=content,
                 embed=embed,
+                # An uploaded banner travels with the post; the embed points
+                # at it by filename, so the file has to be on the message.
+                files=script.render_files(),
                 allowed_mentions=discord.AllowedMentions(
                     users=True, roles=True, everyone=schedule.mention_everyone
                 ),
@@ -104,7 +107,7 @@ class AnnouncementCog(commands.Cog, name="AnnouncementCog"):
         except discord.Forbidden:
             logger.warning(
                 "Cannot post %s in #%s — the bot needs View Channel, Send "
-                "Messages and Embed Links there",
+                "Messages, Embed Links and Attach Files there",
                 schedule.slug,
                 channel.name,
             )

@@ -28,6 +28,7 @@ from core.embed_templates import (
     get_template_store,
 )
 from utils import embed_builder
+from views.banner import BannerModal, describe_banner
 from views.broadcast_view import EmbedComposerModal, show_preview
 from views.common import ack, replace_message, require_manage
 
@@ -209,11 +210,12 @@ def build_studio_embed(state: StudioState, guild: discord.Guild | None) -> disco
         embed_builder.item(f"**Title:** {_shorten(script.title, 200)}"),
         embed_builder.item(f"**Message:** {_measure(script.description)}"),
         embed_builder.item(
-            f"**Image:** {_shorten(script.image_url, 120, fallback='*none*')}"
+            "**Banner:** " + describe_banner(script, missing="*none*")
         ),
         embed_builder.item(f"**Colour:** `#{script.color:06X}`"),
         embed_builder.item(
-            "**Server icon:** " + ("shown" if script.show_icon else "hidden")
+            "**Server icon:** "
+            + ("shown" if script.icon_visible else "hidden")
         ),
     ]
     embed.add_field(
@@ -345,8 +347,9 @@ async def _replace(
     interaction: discord.Interaction,
     embed: discord.Embed | list[discord.Embed],
     view: discord.ui.View | None,
+    attachments: list[discord.File] | None = None,
 ) -> None:
-    await replace_message(interaction, embed, view)
+    await replace_message(interaction, embed, view, attachments=attachments)
 
 
 async def render_studio(interaction: discord.Interaction, state: StudioState) -> None:
@@ -354,11 +357,18 @@ async def render_studio(interaction: discord.Interaction, state: StudioState) ->
         interaction,
         build_studio_embeds(state, interaction.guild),
         EmbedStudioView(state),
+        # The draft card points at `attachment://…` when the banner was
+        # uploaded, so the file has to be on the message for it to show.
+        attachments=state.script.render_files(),
     )
 
 
 async def render_manage(interaction: discord.Interaction, state: StudioState) -> None:
-    await _replace(interaction, build_manage_embed(state), TemplateManageView(state))
+    # The template list carries no banner, so any staged upload is cleared
+    # off the message while this screen is open.
+    await _replace(
+        interaction, build_manage_embed(state), TemplateManageView(state), attachments=[]
+    )
 
 
 async def open_studio(interaction: discord.Interaction) -> None:
@@ -415,6 +425,7 @@ async def open_studio(interaction: discord.Interaction) -> None:
     await interaction.followup.send(
         embeds=build_studio_embeds(state, interaction.guild),
         view=EmbedStudioView(state),
+        files=state.script.render_files(),
         ephemeral=True,
     )
 
@@ -901,6 +912,8 @@ class EmbedStudioView(discord.ui.View):
         self.icon_toggle.label = (
             "Server icon: ON" if state.script.show_icon else "Server icon: OFF"
         )
+        # A picture always posts without the icon, so the toggle has nothing to do.
+        self.icon_toggle.disabled = state.script.has_image
         if state.pages > 1:
             self.add_item(PageButton(state, -1, row=1, manage=False))
             self.add_item(PageButton(state, 1, row=1, manage=False))
@@ -940,6 +953,26 @@ class EmbedStudioView(discord.ui.View):
 
         await interaction.response.send_modal(
             EmbedComposerModal(state.script, on_apply=applied)
+        )
+
+    @discord.ui.button(
+        label="Banner image", style=discord.ButtonStyle.secondary, emoji="🖼️", row=2
+    )
+    async def banner_image(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Uploads, replaces or removes the picture inside the embed."""
+        state = self.state
+
+        async def applied(
+            modal_interaction: discord.Interaction, notice: str, level: str
+        ) -> None:
+            await state.autosave()
+            state.inform(notice, level)
+            await render_studio(modal_interaction, state)
+
+        await interaction.response.send_modal(
+            BannerModal(state.script, on_apply=applied)
         )
 
     @discord.ui.button(

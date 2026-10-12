@@ -1,0 +1,409 @@
+"""
+Unit tests for CGK Onboarding (private per-member onboarding channels).
+"""
+
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import asyncio
+import unittest
+
+import discord
+
+import cogs.cgk_onboarding as cgk
+from cogs.cgk_onboarding import (
+    CATEGORY_LIMIT,
+    SETTING_KEYS,
+    TICKET_INTRO,
+    TOPIC_TEMPLATE,
+    CGKOnboardingCog,
+    CGKSettings,
+    TaggedGroup,
+    channel_name,
+    owner_from_topic,
+    ticket_overwrites,
+)
+from cogs.creator_onboarding import WELCOME_MESSAGE
+from cogs.onboarding import DayGroup
+from core.database import CommunityDatabase
+from views.cgk_onboarding_view import (
+    CGKComposerView,
+    CGKDraft,
+    CGKOnboardingHubView,
+    build_composer_embed,
+)
+
+GUILD_ID = 1
+ROLE_ID = 700
+CATEGORY_ID = 800
+
+
+class FakeRole:
+    def __init__(self, role_id, position, permissions=None, *, default=False, managed=False):
+        self.id = role_id
+        self.position = position
+        self.permissions = permissions or discord.Permissions.none()
+        self.managed = managed
+        self._default = default
+        self.mention = f"<@&{role_id}>"
+
+    def is_default(self):
+        return self._default
+
+    def __ge__(self, other):
+        return self.position >= other.position
+
+    def __hash__(self):
+        return self.id
+
+
+class FakeChannel:
+    def __init__(self, channel_id, name="", topic=None, category=None, overwrites=None):
+        self.id = channel_id
+        self.name = name
+        self.topic = topic
+        self.category = category
+        self.overwrites = overwrites or {}
+        self.mention = f"<#{channel_id}>"
+        self.sent = []
+        self.guild = SimpleNamespace(id=GUILD_ID)
+
+    async def send(self, **kwargs):
+        self.sent.append(kwargs)
+        return SimpleNamespace(jump_url=f"https://discord.test/{self.id}")
+
+
+class FakeCategory(discord.CategoryChannel):
+    """A real CategoryChannel subclass so isinstance checks pass."""
+
+    channels = None  # shadows the read-only property
+
+    def __init__(self, category_id=CATEGORY_ID, count=0, manage=True):  # noqa: D107
+        self.id = category_id
+        self.name = "Onboarding"
+        self.channels = [object()] * count
+        self._manage = manage
+
+    def permissions_for(self, member):
+        return SimpleNamespace(manage_channels=self._manage)
+
+
+class FakeTextChannel(discord.TextChannel):
+    """A real TextChannel subclass so isinstance checks pass."""
+
+    category = overwrites = mention = None  # shadow the read-only properties
+
+    def __init__(self, channel_id, name="", topic=None, category=None, overwrites=None):  # noqa: D107
+        self.id = channel_id
+        self.name = name
+        self.topic = topic
+        self.category = category
+        self.overwrites = overwrites or {}
+        self.mention = f"<#{channel_id}>"
+        self.guild = SimpleNamespace(id=GUILD_ID)
+        self.sent = []
+
+    async def send(self, **kwargs):
+        self.sent.append(kwargs)
+        return SimpleNamespace(jump_url=f"https://discord.test/{self.id}")
+
+
+class FakeMember:
+    def __init__(self, guild, member_id, name, *, days_ago=0, roles=None):
+        self.id = member_id
+        self.name = name
+        self.display_name = name.title()
+        self.mention = f"<@{member_id}>"
+        self.bot = False
+        self.guild = guild
+        self.roles = list(roles or [])
+        self.joined_at = datetime.now(timezone.utc) - timedelta(days=days_ago, hours=1)
+        self.added = []
+        self.fail_add = False
+
+    async def add_roles(self, role, reason=None):
+        if self.fail_add:
+            raise discord.Forbidden(SimpleNamespace(status=403, reason="no"), "no")
+        self.added.append(role)
+        self.roles.append(role)
+
+    def __str__(self):
+        return self.name
+
+
+class FakeGuild:
+    def __init__(self, *, category=None, bot_position=10, manage_roles=True):
+        self.id = GUILD_ID
+        self.chunked = True
+        self.default_role = FakeRole(GUILD_ID, 0, default=True)
+        self.access_role = FakeRole(ROLE_ID, 5)
+        self.mod_role = FakeRole(600, 4, discord.Permissions(manage_messages=True))
+        self.plain_role = FakeRole(601, 3)
+        self.bot_role = FakeRole(602, bot_position, discord.Permissions(administrator=True), managed=True)
+        self.roles = [self.default_role, self.access_role, self.mod_role, self.plain_role, self.bot_role]
+        self.me = discord.Object(999)
+        self.me.top_role = self.bot_role
+        self.me.guild_permissions = SimpleNamespace(manage_roles=manage_roles)
+        self.category_channel = category if category is not None else FakeCategory()
+        self.channels = {CATEGORY_ID: self.category_channel}
+        self.members = []
+        self.created = []
+
+    def get_channel(self, channel_id):
+        return self.channels.get(channel_id)
+
+    def get_role(self, role_id):
+        return next((role for role in self.roles if role.id == role_id), None)
+
+    async def create_text_channel(self, name, *, category, overwrites, topic, reason):
+        channel = FakeTextChannel(
+            5000 + len(self.created), name, topic=topic, category=category, overwrites=overwrites
+        )
+        self.created.append(channel)
+        self.channels[channel.id] = channel
+        return channel
+
+
+def view_factory():
+    return "VIEW"
+
+
+class HelperTests(unittest.TestCase):
+    def test_channel_names(self):
+        self.assertEqual(channel_name(SimpleNamespace(name="lemon", id=1)), "lemon-onboarding")
+        self.assertEqual(channel_name(SimpleNamespace(name="Lemon.PC", id=1)), "lemon-pc-onboarding")
+        self.assertEqual(channel_name(SimpleNamespace(name="__", id=7)), "member-7-onboarding")
+
+    def test_owner_from_topic(self):
+        topic = TOPIC_TEMPLATE.format(member="lemon", member_id=123456789012345678)
+        self.assertEqual(owner_from_topic(topic), 123456789012345678)
+        self.assertIsNone(owner_from_topic("General chat"))
+        self.assertIsNone(owner_from_topic(None))
+
+    def test_only_member_staff_and_bot_can_see_the_channel(self):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        overwrites = ticket_overwrites(guild, member)
+        self.assertIs(overwrites[guild.default_role].view_channel, False)
+        self.assertIs(overwrites[member].view_channel, True)
+        self.assertIs(overwrites[member].send_messages, True)
+        self.assertIs(overwrites[guild.mod_role].view_channel, True)
+        self.assertIs(overwrites[guild.me].view_channel, True)
+        self.assertNotIn(guild.plain_role, overwrites)
+        self.assertNotIn(guild.access_role, overwrites)
+        self.assertNotIn(guild.bot_role, overwrites)  # managed roles are skipped
+
+
+class CGKTestCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = TemporaryDirectory()
+        self.db = CommunityDatabase(Path(self.tmp.name) / "community.sqlite3")
+        await self.db.initialize()
+        self.cog = CGKOnboardingCog.__new__(CGKOnboardingCog)
+        self.cog.bot = None
+        self.cog.db = self.db
+        self._pace = cgk.CREATE_PACE_SECONDS
+        cgk.CREATE_PACE_SECONDS = 0
+        self._defaults = dict(cgk.ENV_DEFAULTS)
+        cgk.ENV_DEFAULTS.update(category=CATEGORY_ID, role=ROLE_ID)
+
+    async def asyncTearDown(self):
+        cgk.CREATE_PACE_SECONDS = self._pace
+        cgk.ENV_DEFAULTS.clear()
+        cgk.ENV_DEFAULTS.update(self._defaults)
+        await self.db.close()
+        self.tmp.cleanup()
+
+    async def deliver(self, guild, members, batch_id):
+        return await self.cog.deliver(
+            guild=guild,
+            members=members,
+            moderator=SimpleNamespace(id=9),
+            batch_id=batch_id,
+            view_factory=view_factory,
+        )
+
+
+class SettingsTests(CGKTestCase):
+    async def test_defaults_then_saved_values(self):
+        settings = await self.cog.settings(GUILD_ID)
+        self.assertEqual((settings.category_id, settings.role_id), (CATEGORY_ID, ROLE_ID))
+        self.assertEqual(settings.sources, {"category": "env", "role": "env"})
+        await self.cog.set_value(GUILD_ID, "role", 701)
+        settings = await self.cog.settings(GUILD_ID)
+        self.assertEqual((settings.role_id, settings.sources["role"]), (701, "saved"))
+        self.assertEqual(await self.db.get_setting(GUILD_ID, SETTING_KEYS["role"]), "701")
+
+    async def test_setup_problems(self):
+        settings = await self.cog.settings(GUILD_ID)
+        self.assertEqual(self.cog.setup_problems(FakeGuild(), settings), [])
+        broken = FakeGuild(bot_position=2, manage_roles=False)
+        broken.channels.clear()
+        problems = " ".join(self.cog.setup_problems(broken, settings))
+        self.assertIn("category", problems)
+        self.assertIn("Manage Roles", problems)
+        self.assertIn("above", problems)
+        no_manage = FakeGuild(category=FakeCategory(manage=False))
+        self.assertIn("Manage Channels", " ".join(self.cog.setup_problems(no_manage, settings)))
+
+
+class TicketTests(CGKTestCase):
+    async def test_open_creates_private_channel_and_tags_member(self):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        result = await self.deliver(guild, [member], batch_id=1)
+        self.assertEqual(len(result.created), 1)
+        channel = guild.created[0]
+        self.assertEqual(channel.name, "lemon-onboarding")
+        self.assertIs(channel.category, guild.category_channel)
+        self.assertEqual(owner_from_topic(channel.topic), 42)
+        sent = channel.sent[0]
+        self.assertTrue(sent["content"].startswith(TICKET_INTRO.format(mention="<@42>")))
+        self.assertTrue(sent["content"].endswith(WELCOME_MESSAGE))
+        self.assertIn("unlock all of the server's channels", sent["content"])
+        self.assertEqual(sent["view"], "VIEW")
+        self.assertEqual(await self.cog.owner_of(channel), 42)
+
+    async def test_owner_lookup_falls_back_to_the_database(self):
+        guild = FakeGuild()
+        await self.deliver(guild, [FakeMember(guild, 42, "lemon")], batch_id=1)
+        channel = guild.created[0]
+        channel.topic = "renamed by a moderator"
+        self.assertEqual(await self.cog.owner_of(channel), 42)
+        self.assertIsNone(await self.cog.owner_of(FakeChannel(1234)))
+
+    async def test_clear_last_group_and_retag_reuses_channel(self):
+        guild = FakeGuild()
+        first = [FakeMember(guild, 1, "ann"), FakeMember(guild, 2, "bob")]
+        second = [FakeMember(guild, 3, "cat")]
+        await self.deliver(guild, first, batch_id=100)
+        await asyncio.sleep(0.01)
+        await self.deliver(guild, second, batch_id=200)
+        self.assertEqual(await self.cog.tagged_ids(GUILD_ID), {1, 2, 3})
+
+        group = await self.cog.last_group(GUILD_ID)
+        self.assertEqual((group.batch_id, group.count), (200, 1))
+        self.assertEqual(await self.cog.clear_last_group(GUILD_ID), 1)
+        self.assertEqual(await self.cog.tagged_ids(GUILD_ID), {1, 2})
+        self.assertEqual((await self.cog.last_group(GUILD_ID)).batch_id, 100)
+
+        again = await self.deliver(guild, second, batch_id=300)
+        self.assertEqual((len(again.created), len(again.reused)), (0, 1))
+        self.assertEqual(len(guild.created), 3)
+        self.assertEqual(len(guild.created[2].sent), 2)  # re-tagged in the same channel
+
+    async def test_test_run_does_not_tag(self):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        channel, created = await self.cog.open_ticket(
+            member, guild.category_channel, "VIEW", batch_id=None, tagged_by=None
+        )
+        self.assertTrue(created)
+        self.assertEqual(await self.cog.tagged_ids(GUILD_ID), set())
+        self.assertIsNone(await self.cog.last_group(GUILD_ID))
+        self.assertEqual(await self.cog.owner_of(channel), 42)
+
+    async def test_full_category_is_reported(self):
+        guild = FakeGuild(category=FakeCategory(count=CATEGORY_LIMIT))
+        result = await self.deliver(guild, [FakeMember(guild, 1, "ann")], batch_id=1)
+        self.assertEqual(result.opened, 0)
+        self.assertIn("category is full", result.failed[0][1])
+        self.assertEqual(await self.cog.tagged_ids(GUILD_ID), set())
+
+    async def test_pending_skips_tagged_and_members_with_access(self):
+        guild = FakeGuild()
+        fresh = FakeMember(guild, 1, "ann")
+        has_access = FakeMember(guild, 2, "bob", roles=[guild.access_role])
+        tagged = FakeMember(guild, 3, "cat")
+        old = FakeMember(guild, 4, "dan", days_ago=400)
+        guild.members = [fresh, has_access, tagged, old]
+        await self.deliver(guild, [tagged], batch_id=1)
+        self.assertEqual([m.id for m in await self.cog.pending_members(guild)], [1])
+
+
+class CompletionTests(CGKTestCase):
+    async def test_grants_role_and_counts_completion(self):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        guild.members = [member]
+        await self.deliver(guild, [member], batch_id=1)
+        self.assertTrue(await self.cog.complete(member))
+        self.assertEqual(member.added, [guild.access_role])
+        self.assertTrue(await self.cog.complete(member))  # already has it: no second add
+        self.assertEqual(len(member.added), 1)
+        stats = await self.cog.stats(guild)
+        self.assertEqual((stats["channels"], stats["completed"], stats["pending"]), (1, 1, 0))
+
+    async def test_role_failure_returns_false(self):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        member.fail_add = True
+        self.assertFalse(await self.cog.complete(member))
+        await self.cog.set_value(GUILD_ID, "role", 12345)  # a role that does not exist
+        member.fail_add = False
+        self.assertFalse(await self.cog.complete(member))
+
+
+class ComposerTests(unittest.TestCase):
+    def make_draft(self, *, groups=True, problems=(), last=None):
+        members = [SimpleNamespace(id=1, display_name="Ann", joined_at=datetime.now(timezone.utc))]
+        return CGKDraft(
+            user_id=7,
+            groups=[DayGroup("d0", "Joined today", "", members)] if groups else [],
+            settings=CGKSettings(CATEGORY_ID, ROLE_ID, {"category": "env", "role": "env"}),
+            last_group=last,
+            problems=list(problems),
+        )
+
+    def test_ready_to_send(self):
+        async def check():
+            view = CGKComposerView(self.make_draft(last=TaggedGroup(5, 3, 1_700_000_000)))
+            self.assertEqual(view.send.label, "Open 1 onboarding channel")
+            self.assertFalse(view.send.disabled)
+            self.assertFalse(view.clear_and_rescan.disabled)
+
+        asyncio.run(check())
+
+    def test_blocked_by_setup_problems_and_nothing_to_clear(self):
+        async def check():
+            view = CGKComposerView(self.make_draft(problems=["Manage Roles"]))
+            self.assertTrue(view.send.disabled)
+            self.assertTrue(view.clear_and_rescan.disabled)
+
+        asyncio.run(check())
+
+    def test_everyone_tagged_still_offers_clear_and_rescan(self):
+        async def check():
+            draft = self.make_draft(groups=False, last=TaggedGroup(5, 3, 1_700_000_000))
+            view = CGKComposerView(draft)
+            self.assertTrue(view.send.disabled)
+            self.assertFalse(view.clear_and_rescan.disabled)
+            self.assertFalse(any(isinstance(item, discord.ui.Select) for item in view.children))
+            guild = SimpleNamespace(get_channel=lambda _: SimpleNamespace(name="Onboarding"))
+            embed = build_composer_embed(draft, guild)
+            self.assertIn("**3** members", embed.description)
+            self.assertIn("<@&700>", embed.description)
+
+        asyncio.run(check())
+
+    def test_hub_is_persistent(self):
+        async def check():
+            hub = CGKOnboardingHubView()
+            self.assertTrue(hub.is_persistent())
+            self.assertEqual(
+                {child.custom_id for child in hub.children},
+                {
+                    "cgk_onboarding_hub:scan",
+                    "cgk_onboarding_hub:test",
+                    "cgk_onboarding_hub:checkpoint",
+                    "cgk_onboarding_hub:settings",
+                    "cgk_onboarding_hub:stats",
+                },
+            )
+
+        asyncio.run(check())
+
+
+if __name__ == "__main__":
+    unittest.main()
