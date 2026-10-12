@@ -14,7 +14,7 @@ Three systems power it:
 | System | What it does |
 | --- | --- |
 | **CGK Onboarding** | Opens a private, ticket-style **#handle-onboarding** channel for each new member, walks them through the TikTok Shop questions, the community rules and the Slack-connected questionnaire, then grants the access role that unlocks the rest of the server. |
-| **Creator Onboarding** | Tags recently joined members in one post that asks *Are you a TikTok Shop creator?* with **✅ YES / ❌ NO** buttons. Each member gets a private reply based on their answer. |
+| **Creator Onboarding** | Opens a private **#handle-onboarding** channel for each recently joined member and tags them there with *Are you a TikTok Shop creator?* (**✅ YES / ❌ NO**). The member works through onboarding in that channel and can chat with the team there directly. |
 | **Information Onboarding** | Scans for members who joined recently and were never welcomed, lets you pick **which join days** to include, then posts a tagged welcome and sends each member a warm branded DM. Everyone welcomed is logged so nobody is welcomed twice. |
 | **Community Reports** | Daily growth baselines, joins per day, monthly trends and most-active members. Deploy one public report and it refreshes itself in place every few hours. |
 | **Engagement Reports** | Ranks every member by messages, reactions and threads for any date range, published as a formal summary plus a full text file. |
@@ -162,7 +162,7 @@ You will see output indicating that the bot has connected:
 | Button | What it opens |
 | --- | --- |
 | **🎟️ CGK Onboarding** | Scan new members and open a private onboarding channel for each. **🧪 Test on myself** opens one for you. |
-| **👋 Onboarding** | Creator onboarding: tag new members with the TikTok Shop question (✅ YES / ❌ NO). **🧪 Test message** sends it to any channel. |
+| **👋 Onboarding** | Creator onboarding: open a private onboarding channel for each new member and tag them there with the TikTok Shop question (✅ YES / ❌ NO). **🧪 Test message** sends it to any channel. |
 | **ℹ️ Information Onboarding** | Scan for new members, pick the join days and the channel to post in, send the welcome. Set a default channel and message. |
 | **📊 Community Reports** | Preview or deploy self-refreshing growth reports. |
 | **📈 Engagement Report** | Rank members by messages, reactions and threads. |
@@ -180,10 +180,10 @@ Two optional shortcuts post standalone panels for teams that prefer them: `/onbo
 #### Step 12a: CGK Onboarding (private onboarding channels)
 
 1. On the Mod Panel click **🎟️ CGK Onboarding**.
-2. *(First time)* check **⚙️ Settings**. It already points to the onboarding category (`1377020906987065414`) and the access role (`1534216662415573023`). Anything that would block it is listed there — typically:
+2. *(First time)* check **⚙️ Settings**. It already points to the onboarding category (`1557840609664958599`) and the access role (`1534216662415573023`). Anything that would block it is listed there — typically:
    - the bot needs **Manage Channels** in the category and **Manage Roles**,
    - the bot's own role must sit **above** the access role in *Server Settings → Roles*.
-3. Click **🧪 Test on myself**. The bot opens an onboarding channel for you so you can click through the whole flow. Submitting the questionnaire really saves your answers for Slack and grants the role. Delete the channel when you're done.
+3. Click **🧪 Test on myself** — or type `/test-onboarding` (add `member:` to test it on someone else). The bot opens a private onboarding channel so you can click through the whole flow. Submitting the questionnaire really saves the answers for Slack and grants the role. Nobody is added to a tagged group. Press **🔒 Close onboarding** in the channel when you're done.
 4. Click **🔍 Scan for new members**. Members who joined in the last 30 days, haven't been tagged yet and don't already have the access role are grouped by join day. Pick the days and press **🎟️ Open N onboarding channels**.
 5. Need to tag a group again? Scan, then press **♻️ Clear last tagged group & rescan**. The most recent group goes back in the list, and tagging them again re-uses their existing channels.
 6. *(Optional)* **📌 Post Shop 101 checkpoint** posts an *I've finished TikTok Shop 101* button in #🛍️tiktok-shop-101, so 🌱 creators can continue from there.
@@ -196,9 +196,12 @@ What each member gets:
   to unlock all of the server's channels.
   👋 Welcome to the CGK Linens Creator Community! … Are you a TikTok Shop creator?
   [✅ YES] [❌ NO]   → same flow as below; replies stay in the channel
+  [🔒 Close onboarding]
 ```
 
-Only the channel's member can answer in it. Submitting the questionnaire grants the access role, then posts *"You now have full access to the CGK creator community! Head to #opportunities-to-earn …"* in the channel. That completes the workflow. If the role can't be granted, the post says so instead, and a moderator can add it by hand. A category holds at most **50** channels, so delete finished onboarding channels from time to time.
+**Closing a channel:** the member or any moderator can press **🔒 Close onboarding** on the first message. After a quick "are you sure?" the bot deletes the channel. A channel a moderator deletes by hand in Discord is forgotten the same way, and tagging that member again opens a fresh channel.
+
+Only the channel's member can answer in it. Submitting the questionnaire grants the access role, then posts *"You now have full access to the CGK creator community! Head to #opportunities-to-earn …"* in the channel. That completes the workflow. If the role can't be granted, the post says so instead, and a moderator can add it by hand. A category holds at most **50** channels, so close finished onboarding channels from time to time.
 
 ---
 
@@ -206,13 +209,13 @@ Only the channel's member can answer in it. Submitting the questionnaire grants 
 
 1. On the Mod Panel click **👋 Onboarding**.
 2. *(First time)* click **⚙️ Settings** and pick:
-   - **Default welcome channel** — pre-selected every time you send.
+   - **Default test channel** — pre-selected for **🧪 Test message**.
    - **Getting-started channel** — where 🌱 learning creators are sent. Already points to #🛍️tiktok-shop-101 (`1557490449160085615`); pick another channel only if that changes.
    - **Opportunities channel** — linked in the message members get once they finish. Already points to #opportunities-to-earn (`1557773483243741226`).
 3. Click **🧪 Test message**, pick a channel and press **Send test message**. The real interactive message is posted there (nobody tagged, nobody logged) so you can click through every answer yourself.
-4. Click **🔍 Scan for new members**, pick the join days and the channel, then press **✅ Send to N members**. The bot tags everyone, posts the question with **✅ YES / ❌ NO** right below, and logs them so the next scan skips them.
+4. Click **🔍 Scan for new members**, pick the join days, then press **✅ Send to N members**. Each member gets their own private **#handle-onboarding** channel in the onboarding category (`1557840609664958599`, changeable in **🎟️ CGK Onboarding → ⚙️ Settings**) and is tagged there with the question and **✅ YES / ❌ NO** right below. Only they and the team can see the channel, so they can type any questions there and chat with you directly. Everyone is logged so the next scan skips them; a member who already has a channel is re-tagged in it, never given a second one.
 
-What members see — every reply is private (only the member who clicked sees it):
+What members see — the replies stay in their own channel (on a 🧪 test post in a shared channel they are private instead):
 
 ```
 ❌ NO   → how to get started with TikTok Shop (1,000 followers, apply at shop.tiktok.com)
@@ -439,7 +442,7 @@ cgk-bot/
 │   ├── engagement.py     # Activity tracking, SQLite ledger, ranked reports
 │   ├── memberreport.py   # Growth snapshots, join tallies, self-refreshing reports
 │   ├── onboarding.py     # Member scanning, welcome posts, warm DMs, onboarding log
-│   └── mod_panel.py      # /summon, /onboarding, /community-report
+│   └── mod_panel.py      # /summon, /onboarding, /test-onboarding, /community-report
 ├── views/
 │   ├── __init__.py
 │   ├── banner.py                 # Shared banner modal: upload, link or remove

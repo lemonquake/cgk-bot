@@ -2,8 +2,8 @@
 Interfaces for creator onboarding (the TikTok Shop question).
 Created by Aljay Leodones for CGK Linens.
 
-Member flow, shared by the public "Onboarding" post and every private
-CGK Onboarding channel:
+Member flow, run inside each member's private onboarding channel (and on
+any 🧪 test post):
 
     ❌ NO   ->  "how to get started on TikTok Shop" guide
     ✅ YES  ->  "where are you in your TikTok Shop journey?"
@@ -19,9 +19,14 @@ messages, so the conversation stays in their channel - and only that member
 can answer there. Every button has a static custom_id, so posts keep working
 after a restart.
 
-Moderator side mirrors Information Onboarding: Scan -> pick the join days
-and the channel -> Send. **🧪 Test message** posts the interactive message to
-any channel without tagging or logging anyone.
+The first post in a private channel also carries **🔒 Close onboarding**:
+the member or any moderator can close (delete) the channel from there.
+
+Moderator side: Scan -> pick the join days -> Send. Every selected member
+gets their own private ``#<handle>-onboarding`` channel in the onboarding
+category and is tagged there with the TikTok Shop question, so they can also
+chat with the team directly. **🧪 Test message** posts the interactive
+message to any channel without tagging or logging anyone.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import logging
 
 import discord
 
+from cogs.cgk_onboarding import TICKET_INTRO, can_close
 from cogs.creator_onboarding import (
     CHANNEL_HINTS,
     CHANNEL_LABELS,
@@ -183,6 +189,108 @@ class CreatorWelcomeView(discord.ui.View):
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if await _respond(interaction, NOT_A_CREATOR_MESSAGE, suppress_embeds=True):
             await _record(interaction, is_creator=False)
+
+
+class OnboardingTicketView(CreatorWelcomeView):
+    """✅ YES / ❌ NO plus 🔒 Close, on the first post in a private onboarding channel."""
+
+    @discord.ui.button(
+        label="Close onboarding",
+        style=discord.ButtonStyle.danger,
+        emoji="🔒",
+        custom_id="cgk_onboarding:close",
+        row=1,
+    )
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await ask_to_close(interaction)
+
+
+async def ask_to_close(interaction: discord.Interaction) -> None:
+    """Checks who clicked 🔒 Close, then asks them to confirm."""
+    cgk = _cgk_cog(interaction)
+    if cgk is None or interaction.guild is None:
+        await missing_cog(interaction, "CGK Onboarding")
+        return
+    owner = await ticket_owner(interaction)
+    if owner is None:
+        await interaction.response.send_message(
+            "This isn't a private onboarding channel, so there is nothing to close.",
+            ephemeral=True,
+        )
+        return
+    if not can_close(interaction.user, interaction.channel, owner):
+        await interaction.response.send_message(
+            f"Only <@{owner}> or the CGK team can close this onboarding channel.",
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+        return
+    if interaction.user.id == owner:
+        detail = (
+            "This channel and its messages are deleted. If you haven't finished "
+            "onboarding yet, ask the team in a support ticket to open a new one."
+        )
+    else:
+        detail = (
+            f"This deletes <@{owner}>'s onboarding channel and its messages for "
+            "everyone. Tagging them again opens a fresh channel."
+        )
+    await interaction.response.send_message(
+        embed=embed_builder.warning_embed("Close this onboarding channel?", detail),
+        view=CloseConfirmView(interaction.channel.id),
+        ephemeral=True,
+        allowed_mentions=NO_MENTIONS,
+    )
+
+
+class CloseConfirmView(discord.ui.View):
+    """The "are you sure?" behind 🔒 Close onboarding."""
+
+    def __init__(self, channel_id: int) -> None:
+        super().__init__(timeout=120)
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="Yes, close it", style=discord.ButtonStyle.danger, emoji="🔒")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        cgk = _cgk_cog(interaction)
+        channel = interaction.guild.get_channel(self.channel_id) if interaction.guild else None
+        if cgk is None or not isinstance(channel, discord.TextChannel):
+            await interaction.response.edit_message(
+                embed=embed_builder.info_embed("Already closed", "That channel no longer exists."),
+                view=None,
+            )
+            return
+        # Checked again: roles can change while the confirmation is open.
+        if not can_close(interaction.user, channel, await cgk.owner_of(channel)):
+            await interaction.response.edit_message(
+                embed=embed_builder.error_embed(
+                    "Not allowed", "Only the member or the CGK team can close this channel."
+                ),
+                view=None,
+            )
+            return
+        await interaction.response.edit_message(
+            embed=embed_builder.info_embed("Closing...", "Deleting the onboarding channel."),
+            view=None,
+        )
+        self.stop()
+        try:
+            await cgk.close_ticket(channel, closed_by=interaction.user)
+        except discord.HTTPException as exc:
+            logger.warning("Could not close onboarding channel %s: %s", channel.id, exc)
+            await interaction.edit_original_response(
+                embed=embed_builder.error_embed(
+                    "Could not close the channel",
+                    "The bot needs **Manage Channels** here. A moderator can delete it by hand.",
+                ),
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            embed=embed_builder.info_embed("Kept open", "The channel was not closed."), view=None
+        )
+        self.stop()
 
 
 class CreatorJourneyView(discord.ui.View):
@@ -338,19 +446,29 @@ class CreatorDraft:
     user_id: int
     groups: list[DayGroup]
     settings: CreatorSettings
-    channel_id: int | None
+    # The private channels' category (from CGK Onboarding) and anything that
+    # would stop them being opened.
+    category: str = "*not set*"
+    problems: list[str] = field(default_factory=list)
     selected_keys: set[str] = field(default_factory=lambda: {"all"})
     notice: tuple[str, str] | None = None
 
     @classmethod
     def start(
-        cls, user_id: int, groups: list[DayGroup], settings: CreatorSettings
+        cls,
+        user_id: int,
+        groups: list[DayGroup],
+        settings: CreatorSettings,
+        *,
+        category: str = "*not set*",
+        problems: list[str] | None = None,
     ) -> "CreatorDraft":
         return cls(
             user_id=user_id,
             groups=groups,
             settings=settings,
-            channel_id=settings.default_channel_id,
+            category=category,
+            problems=list(problems or []),
         )
 
     def apply_selection(self, keys: set[str]) -> None:
@@ -369,10 +487,6 @@ class CreatorDraft:
         }
         return sorted(unique.values(), key=lambda m: m.joined_at, reverse=True)
 
-    @property
-    def is_default_channel(self) -> bool:
-        return bool(self.channel_id) and self.channel_id == self.settings.default_channel_id
-
     def inform(self, message: str, level: str = "info") -> None:
         self.notice = (level, message)
 
@@ -382,7 +496,8 @@ class CreatorDraft:
 
 
 def post_preview(tags: str = "") -> discord.Embed:
-    body = f"*{tags}*\n\n{WELCOME_MESSAGE}" if tags else WELCOME_MESSAGE
+    intro = TICKET_INTRO.format(mention=f"*{tags}*") if tags else ""
+    body = f"{intro}\n\n{WELCOME_MESSAGE}" if intro else WELCOME_MESSAGE
     return embed_builder.accent_embed(
         "Post preview", f"{body}\n\n`[ ✅ YES ]`  `[ ❌ NO ]`"[:4000]
     )
@@ -413,24 +528,29 @@ def build_composer_embeds(draft: CreatorDraft) -> list[discord.Embed]:
         ),
         "",
     ]
-    if draft.channel_id:
-        tag = "  ⭐ *default*" if draft.is_default_channel else ""
-        lines.append(embed_builder.item(f"Posting in <#{draft.channel_id}>{tag}"))
-    else:
-        lines.append(embed_builder.item("⚠️ **No channel chosen** — pick one in the channel menu."))
+    lines.append(
+        embed_builder.item(
+            f"Each member gets a private **#handle-onboarding** channel in {draft.category} "
+            "and is tagged there — only they and the team can see it."
+        )
+    )
+    if draft.problems:
+        lines += [
+            "",
+            embed_builder.section("Fix before sending"),
+            *(embed_builder.item(f"⚠️ {problem}") for problem in draft.problems),
+        ]
     lines += [
         embed_builder.SEPARATOR,
-        "Pick the days and the channel, then press **Send**. Members answer "
-        "with the buttons and get private replies.",
+        "Pick the days, then press **Send**. Members answer with the buttons in "
+        "their own channel and can type any questions there for the team.",
     ]
     control = embed_builder.base_embed(
         title="👋  Creator onboarding", description="\n".join(lines)
     )
 
-    tags = " ".join(f"@{member.display_name}" for member in members[:8])
-    if len(members) > 8:
-        tags += f" … +{len(members) - 8} more"
-    return [control, post_preview(tags or "No members tagged")]
+    tags = f"@{members[0].display_name}" if members else "@member"
+    return [control, post_preview(tags)]
 
 
 async def render_composer(interaction: discord.Interaction, draft: CreatorDraft) -> None:
@@ -473,50 +593,14 @@ class CreatorDaySelect(discord.ui.Select):
         await render_composer(interaction, draft)
 
 
-class CreatorDestinationSelect(discord.ui.ChannelSelect):
-    def __init__(self, draft: CreatorDraft):
-        super().__init__(
-            placeholder="Choose the channel to post the welcome in...",
-            channel_types=TEXT_CHANNEL_TYPES,
-            min_values=1,
-            max_values=1,
-            default_values=[discord.Object(draft.channel_id)] if draft.channel_id else [],
-            row=1,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await ack(interaction)
-        draft: CreatorDraft = self.view.draft  # type: ignore[attr-defined]
-        cog = _creator_cog(interaction)
-        channel = await cog.resolve_channel(interaction.guild, self.values[0].id) if cog else None
-        if channel is None:
-            draft.inform("That channel could not be opened. Pick another.", "error")
-        else:
-            draft.channel_id = channel.id
-            missing = missing_permissions(channel, interaction.guild.me)
-            if missing:
-                draft.inform(
-                    f"The bot is missing **{', '.join(missing)}** in {channel.mention}.",
-                    "warning",
-                )
-            elif not draft.is_default_channel:
-                draft.inform(
-                    f"Posting in {channel.mention}. Press **⭐ Make default** to use it every time.",
-                    "success",
-                )
-        await render_composer(interaction, draft)
-
-
 class CreatorComposerView(discord.ui.View):
     def __init__(self, draft: CreatorDraft):
         super().__init__(timeout=COMPOSER_TIMEOUT)
         self.draft = draft
         self.add_item(CreatorDaySelect(draft))
-        self.add_item(CreatorDestinationSelect(draft))
         count = len(draft.selected_members)
-        self.make_default.disabled = not draft.channel_id or draft.is_default_channel
         self.send.label = f"Send to {count} member{'s' if count != 1 else ''}"
-        self.send.disabled = count == 0 or not draft.channel_id
+        self.send.disabled = count == 0 or bool(draft.problems)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.draft.user_id:
@@ -530,24 +614,12 @@ class CreatorComposerView(discord.ui.View):
             return False
         return await require_manage(interaction)
 
-    @discord.ui.button(label="Make default", style=discord.ButtonStyle.secondary, emoji="⭐", row=2)
-    async def make_default(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await ack(interaction)
-        cog = _creator_cog(interaction)
-        if cog is None:
-            await missing_cog(interaction, "Creator onboarding")
-            return
-        await cog.set_channel(interaction.guild.id, "welcome", self.draft.channel_id)
-        self.draft.settings = await cog.settings(interaction.guild.id)
-        self.draft.inform(f"<#{self.draft.channel_id}> is now the default channel.", "success")
-        await render_composer(interaction, self.draft)
-
-    @discord.ui.button(label="Send", style=discord.ButtonStyle.success, emoji="✅", row=3)
+    @discord.ui.button(label="Send", style=discord.ButtonStyle.success, emoji="✅", row=1)
     async def send(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await ack(interaction)
         await _execute_delivery(interaction, self)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️", row=3)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️", row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await replace_message(
             interaction, embed_builder.info_embed("Cancelled", "Nothing was sent."), None
@@ -570,69 +642,70 @@ class CreatorComposerView(discord.ui.View):
 
 
 async def _execute_delivery(interaction: discord.Interaction, view: CreatorComposerView) -> None:
+    """Opens a private onboarding channel per member and tags them in it."""
     draft = view.draft
     cog = _creator_cog(interaction)
-    if cog is None:
-        await missing_cog(interaction, "Creator onboarding")
+    cgk = _cgk_cog(interaction)
+    if cog is None or cgk is None:
+        await missing_cog(interaction, "Creator onboarding" if cog is None else "CGK Onboarding")
         return
     members = draft.selected_members
     if not members:
         draft.inform("Pick at least one join day first.", "warning")
         await render_composer(interaction, draft)
         return
-    channel = await cog.resolve_channel(interaction.guild, draft.channel_id)
-    if channel is None:
-        draft.channel_id = None
-        draft.inform("That channel no longer exists or the bot cannot see it.", "error")
+    settings = await cgk.settings(interaction.guild.id)
+    problems = cgk.setup_problems(interaction.guild, settings)
+    if problems:
+        draft.problems = problems
+        draft.inform("Fix the setup below before sending.", "error")
         await render_composer(interaction, draft)
         return
-    missing = missing_permissions(channel, interaction.guild.me)
-    if missing:
-        draft.inform(
-            f"The bot needs **{', '.join(missing)}** in {channel.mention} before it can post there.",
-            "error",
+
+    def working(done: int = 0) -> discord.Embed:
+        return embed_builder.info_embed(
+            "Opening onboarding channels...",
+            embed_builder.item(f"Done: **{done}/{len(members)}** (about one per second)"),
         )
-        await render_composer(interaction, draft)
-        return
 
     # Clearing the controls first means a second click cannot send twice.
-    await replace_message(
-        interaction,
-        embed_builder.info_embed(
-            "Sending the welcome...",
-            embed_builder.item(f"Tagging **{len(members)}** member(s) in {channel.mention}"),
-        ),
-        None,
-    )
+    await replace_message(interaction, working(), None)
     view.stop()
 
+    async def progress(done: int, total: int) -> None:
+        await interaction.edit_original_response(embeds=[working(done)], view=None)
+
     try:
-        message, marked = await cog.deliver(
+        result = await cgk.deliver(
             guild=interaction.guild,
             members=members,
             moderator=interaction.user,
-            channel=channel,
-            view=CreatorWelcomeView(),
+            batch_id=interaction.id,
+            view_factory=OnboardingTicketView,
+            progress=progress,
         )
-    except discord.Forbidden:
-        embed = embed_builder.error_embed(
-            "Missing permissions",
-            "The bot could not post in that channel. Grant it **View Channel** and "
-            "**Send Messages**, then scan again. Nobody was logged.",
-        )
-    except discord.HTTPException as exc:
+    except (ValueError, discord.HTTPException) as exc:
         logger.exception("Creator onboarding delivery failed")
-        embed = embed_builder.error_embed("Delivery failed", f"Discord rejected the welcome: {exc}")
+        embed = embed_builder.error_embed("Could not open the channels", str(exc)[:500])
     else:
-        embed = embed_builder.success_embed(
-            "Welcome sent",
-            "\n".join(
-                [
-                    embed_builder.item(f"Members logged as welcomed: **{marked}**"),
-                    embed_builder.item(f"Posted in {channel.mention} · [jump to it]({message.jump_url})"),
-                ]
-            ),
+        marked = await cog.mark_onboarded(
+            interaction.guild.id, result.member_ids, moderator_id=interaction.user.id
         )
+        lines = [
+            embed_builder.item(f"Members tagged in their own channel: **{marked}**"),
+            embed_builder.item(
+                f"New channels: **{len(result.created)}** · "
+                f"existing channels re-tagged: **{len(result.reused)}**"
+            ),
+        ]
+        channels = [channel.mention for channel in (result.created + result.reused)[:15]]
+        if channels:
+            lines.append(embed_builder.item(" ".join(channels)))
+        if result.failed:
+            lines.append(embed_builder.item(f"Could not open: **{len(result.failed)}**"))
+            lines += [embed_builder.item(f"{name} — {reason}") for name, reason in result.failed[:10]]
+        builder = embed_builder.success_embed if result.opened else embed_builder.error_embed
+        embed = builder("Welcome sent" if result.opened else "No channels opened", "\n".join(lines))
     try:
         await interaction.edit_original_response(embeds=[embed], view=None)
     except discord.HTTPException:
@@ -863,9 +936,10 @@ async def build_creator_hub_embed(interaction: discord.Interaction) -> discord.E
     stats = await cog.stats(interaction.guild)
     settings = await cog.settings(interaction.guild.id)
     blocks = [
-        "Tag new members in one post that asks **Are you a TikTok Shop creator?** "
-        "with ✅ YES / ❌ NO buttons. Each member gets a private reply based on "
-        "their answer.",
+        "Give each new member a private **#handle-onboarding** channel and tag "
+        "them there with **Are you a TikTok Shop creator?** (✅ YES / ❌ NO). "
+        "They work through the onboarding in that channel and can chat with the "
+        "team there directly. The category is set in **🎟️ CGK Onboarding → ⚙️ Settings**.",
         embed_builder.SEPARATOR,
         embed_builder.section("Right now"),
         "\n".join(
@@ -940,21 +1014,20 @@ class CreatorOnboardingHubView(discord.ui.View):
             return
 
         settings = await cog.settings(interaction.guild.id)
-        draft = CreatorDraft.start(interaction.user.id, cog.group_by_day(pending), settings)
-        if draft.channel_id:
-            if await cog.resolve_channel(interaction.guild, draft.channel_id) is None:
-                draft.channel_id = None
-                draft.inform(
-                    "Your default channel no longer exists. Pick a channel below, "
-                    "then press **⭐ Make default**.",
-                    "warning",
-                )
-        else:
-            draft.inform(
-                "No default channel yet. Pick one below and press **⭐ Make default** "
-                "to remember it.",
-                "info",
-            )
+        category, problems = "*not set*", ["The **CGK Onboarding** module did not load."]
+        cgk = _cgk_cog(interaction)
+        if cgk is not None:
+            cgk_settings = await cgk.settings(interaction.guild.id)
+            found = cgk.category(interaction.guild, cgk_settings)
+            category = f"**{found.name}**" if found else "*not set*"
+            problems = cgk.setup_problems(interaction.guild, cgk_settings)
+        draft = CreatorDraft.start(
+            interaction.user.id,
+            cog.group_by_day(pending),
+            settings,
+            category=category,
+            problems=problems,
+        )
         await interaction.followup.send(
             embeds=build_composer_embeds(draft),
             view=CreatorComposerView(draft),
@@ -972,8 +1045,12 @@ class CreatorOnboardingHubView(discord.ui.View):
     async def test(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await require_manage(interaction):
             return
+        cog = _creator_cog(interaction)
+        channel_id = None
+        if cog is not None:
+            channel_id = (await cog.settings(interaction.guild.id)).default_channel_id
         await interaction.response.send_message(
-            embed=build_test_embed(None), view=CreatorTestView(), ephemeral=True
+            embed=build_test_embed(channel_id), view=CreatorTestView(channel_id), ephemeral=True
         )
 
     @discord.ui.button(
@@ -1032,6 +1109,7 @@ class CreatorOnboardingHubView(discord.ui.View):
 
 
 __all__ = [
+    "CloseConfirmView",
     "CreatorComposerView",
     "CreatorDraft",
     "CreatorJourneyView",
@@ -1041,6 +1119,7 @@ __all__ = [
     "CreatorSettingsView",
     "CreatorTestView",
     "CreatorWelcomeView",
+    "OnboardingTicketView",
     "Shop101DoneView",
     "build_composer_embeds",
     "build_creator_hub_embed",

@@ -20,6 +20,7 @@ from cogs.cgk_onboarding import (
     CGKOnboardingCog,
     CGKSettings,
     TaggedGroup,
+    can_close,
     channel_name,
     owner_from_topic,
     ticket_overwrites,
@@ -33,6 +34,7 @@ from views.cgk_onboarding_view import (
     CGKOnboardingHubView,
     build_composer_embed,
 )
+from views.creator_onboarding_view import OnboardingTicketView
 
 GUILD_ID = 1
 ROLE_ID = 700
@@ -103,10 +105,14 @@ class FakeTextChannel(discord.TextChannel):
         self.mention = f"<#{channel_id}>"
         self.guild = SimpleNamespace(id=GUILD_ID)
         self.sent = []
+        self.deleted = None
 
     async def send(self, **kwargs):
         self.sent.append(kwargs)
         return SimpleNamespace(jump_url=f"https://discord.test/{self.id}")
+
+    async def delete(self, *, reason=None):
+        self.deleted = reason
 
 
 class FakeMember:
@@ -181,6 +187,18 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(owner_from_topic("General chat"))
         self.assertIsNone(owner_from_topic(None))
 
+    def test_owner_or_moderators_can_close(self):
+        def channel(permissions):
+            return SimpleNamespace(permissions_for=lambda member: permissions)
+
+        member = SimpleNamespace(id=42)
+        nobody = discord.Permissions.none()
+        self.assertTrue(can_close(member, channel(nobody), 42))
+        self.assertFalse(can_close(SimpleNamespace(id=7), channel(nobody), 42))
+        mod = channel(discord.Permissions(manage_messages=True))
+        self.assertTrue(can_close(SimpleNamespace(id=7), mod, 42))
+        self.assertFalse(can_close(member, mod, None))  # not an onboarding channel
+
     def test_only_member_staff_and_bot_can_see_the_channel(self):
         guild = FakeGuild()
         member = FakeMember(guild, 42, "lemon")
@@ -254,6 +272,7 @@ class TicketTests(CGKTestCase):
         member = FakeMember(guild, 42, "lemon")
         result = await self.deliver(guild, [member], batch_id=1)
         self.assertEqual(len(result.created), 1)
+        self.assertEqual(result.member_ids, [42])
         channel = guild.created[0]
         self.assertEqual(channel.name, "lemon-onboarding")
         self.assertIs(channel.category, guild.category_channel)
@@ -262,6 +281,7 @@ class TicketTests(CGKTestCase):
         self.assertTrue(sent["content"].startswith(TICKET_INTRO.format(mention="<@42>")))
         self.assertTrue(sent["content"].endswith(WELCOME_MESSAGE))
         self.assertIn("unlock all of the server's channels", sent["content"])
+        self.assertIn("Got a question", sent["content"])
         self.assertEqual(sent["view"], "VIEW")
         self.assertEqual(await self.cog.owner_of(channel), 42)
 
@@ -345,6 +365,27 @@ class CompletionTests(CGKTestCase):
         self.assertFalse(await self.cog.complete(member))
 
 
+class CloseTests(CGKTestCase):
+    async def test_close_deletes_and_next_tag_opens_a_fresh_channel(self):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        await self.deliver(guild, [member], batch_id=1)
+        channel = guild.created[0]
+        await self.cog.close_ticket(channel, closed_by=member)
+        self.assertIn("closed by lemon", channel.deleted)
+        self.assertEqual((await self.cog.stats(guild))["channels"], 0)
+        self.assertEqual(await self.cog.owner_of(channel), 42)  # topic still names them
+        await self.cog.clear_last_group(GUILD_ID)
+        await self.deliver(guild, [member], batch_id=2)
+        self.assertEqual(len(guild.created), 2)
+
+    async def test_channel_deleted_by_hand_is_forgotten(self):
+        guild = FakeGuild()
+        await self.deliver(guild, [FakeMember(guild, 42, "lemon")], batch_id=1)
+        await self.cog.on_guild_channel_delete(guild.created[0])
+        self.assertEqual((await self.cog.stats(guild))["channels"], 0)
+
+
 class ComposerTests(unittest.TestCase):
     def make_draft(self, *, groups=True, problems=(), last=None):
         members = [SimpleNamespace(id=1, display_name="Ann", joined_at=datetime.now(timezone.utc))]
@@ -384,6 +425,21 @@ class ComposerTests(unittest.TestCase):
             embed = build_composer_embed(draft, guild)
             self.assertIn("**3** members", embed.description)
             self.assertIn("<@&700>", embed.description)
+
+        asyncio.run(check())
+
+    def test_ticket_view_has_answers_and_close(self):
+        async def check():
+            view = OnboardingTicketView()
+            self.assertTrue(view.is_persistent())
+            self.assertEqual(
+                {child.custom_id for child in view.children},
+                {
+                    "cgk_creator_onboarding:yes",
+                    "cgk_creator_onboarding:no",
+                    "cgk_onboarding:close",
+                },
+            )
 
         asyncio.run(check())
 

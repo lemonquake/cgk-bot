@@ -124,7 +124,7 @@ CREATOR_OPPORTUNITIES_CHANNEL_ID = _optional_int(
 # access role that unlocks the rest of the server. Both can be changed from
 # the Mod Panel (CGK Onboarding -> Settings); saved choices win.
 CGK_ONBOARDING_CATEGORY_ID = _optional_int(
-    "CGK_ONBOARDING_CATEGORY_ID", "1377020906987065414"
+    "CGK_ONBOARDING_CATEGORY_ID", "1557840609664958599"
 )
 CGK_ONBOARDING_ROLE_ID = _optional_int("CGK_ONBOARDING_ROLE_ID", "1534216662415573023")
 

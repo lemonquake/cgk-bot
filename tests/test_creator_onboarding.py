@@ -396,36 +396,40 @@ class QuestionnaireCompletionTests(unittest.TestCase):
 
 
 class ModeratorViewTests(unittest.TestCase):
-    def make_draft(self, default_channel=500):
+    def make_draft(self, problems=None):
         groups = [
             DayGroup("d0", "Joined today", "", [FakeMember(1)]),
             DayGroup("d1", "Joined yesterday", "", [FakeMember(2, days_ago=1)]),
         ]
         settings = CreatorSettings(
-            channels={"welcome": default_channel, "getting_started": None},
-            sources={"welcome": "saved", "getting_started": "unset"},
+            channels={"welcome": None, "getting_started": None},
+            sources={"welcome": "unset", "getting_started": "unset"},
         )
-        return CreatorDraft.start(7, groups, settings)
+        return CreatorDraft.start(
+            7, groups, settings, category="**Onboarding**", problems=problems
+        )
 
-    def test_composer_ready_on_default_channel(self):
+    def test_composer_opens_private_channels(self):
         async def check():
             draft = self.make_draft()
             view = CreatorComposerView(draft)
             self.assertEqual(view.send.label, "Send to 2 members")
             self.assertFalse(view.send.disabled)
-            self.assertTrue(view.make_default.disabled)
+            embeds = build_composer_embeds(draft)
+            self.assertIn("#handle-onboarding", embeds[0].description)
+            self.assertIn("**Onboarding**", embeds[0].description)
+            self.assertIn("Are you a TikTok Shop creator?", embeds[1].description)
+            self.assertIn("private onboarding channel", embeds[1].description)
             draft.apply_selection({"d1"})
             self.assertEqual([m.id for m in draft.selected_members], [2])
 
         run(check())
 
-    def test_composer_needs_a_channel(self):
+    def test_composer_blocked_by_setup_problems(self):
         async def check():
-            draft = self.make_draft(default_channel=None)
+            draft = self.make_draft(problems=["The onboarding **category** was not found."])
             self.assertTrue(CreatorComposerView(draft).send.disabled)
-            embeds = build_composer_embeds(draft)
-            self.assertIn("No channel chosen", embeds[0].description)
-            self.assertIn("Are you a TikTok Shop creator?", embeds[1].description)
+            self.assertIn("Fix before sending", build_composer_embeds(draft)[0].description)
 
         run(check())
 

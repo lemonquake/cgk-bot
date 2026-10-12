@@ -22,6 +22,7 @@ from views.creator_onboarding_view import (
     CreatorOnboardingHubView,
     CreatorQuestionnaireView,
     CreatorWelcomeView,
+    OnboardingTicketView,
     Shop101DoneView,
 )
 from views.member_report_view import MemberReportHubView
@@ -77,6 +78,8 @@ class CGKBot(commands.Bot):
         # Member-facing creator buttons, shared by the public Onboarding post
         # and every private CGK onboarding channel.
         self.add_view(CreatorWelcomeView())
+        # YES / NO / 🔒 Close on the first post in a private onboarding channel.
+        self.add_view(OnboardingTicketView())
         self.add_view(CreatorJourneyView())
         self.add_view(Shop101DoneView())
         self.add_view(CreatorQuestionnaireView())

@@ -8,7 +8,8 @@ onboarding category. Only that member and the server's moderators can see
 it. The member is tagged there with the creator questions (✅ YES / ❌ NO,
 then 🌱 / 🔥), the community rules and the Slack-connected questionnaire.
 Submitting the questionnaire grants the access role that unlocks the rest
-of the server.
+of the server. The member or any moderator can close the channel with its
+🔒 Close onboarding button, which deletes it.
 
 Every send is remembered as one "tagged group", so the most recent group can
 be cleared and tagged again from the scan screen.
@@ -41,7 +42,8 @@ logger = logging.getLogger("cgk_bot.cgk_onboarding")
 TICKET_INTRO = (
     "{mention} 🔒 This is your private onboarding channel — only you and the "
     "CGK team can see it. **Finish the onboarding below to unlock all of the "
-    "server's channels.**"
+    "server's channels.** Got a question along the way? Just type it here and "
+    "the team will reply."
 )
 TOPIC_TEMPLATE = "Private CGK onboarding for {member} · member ID {member_id}"
 _TOPIC_OWNER = re.compile(r"member ID (\d+)")
@@ -96,6 +98,7 @@ class TicketResult:
     created: list[discord.TextChannel] = field(default_factory=list)
     reused: list[discord.TextChannel] = field(default_factory=list)
     failed: list[tuple[str, str]] = field(default_factory=list)  # (member, reason)
+    member_ids: list[int] = field(default_factory=list)  # everyone tagged in a channel
 
     @property
     def opened(self) -> int:
@@ -117,6 +120,18 @@ def is_staff_role(role: discord.Role) -> bool:
     if role.is_default() or role.managed:
         return False
     permissions = role.permissions
+    return any(getattr(permissions, name, False) for name in STAFF_PERMISSIONS)
+
+
+def can_close(
+    member: discord.Member, channel: discord.abc.GuildChannel, owner_id: int | None
+) -> bool:
+    """The channel's own member, or anyone who moderates, may close it."""
+    if owner_id is None:
+        return False
+    if member.id == owner_id:
+        return True
+    permissions = channel.permissions_for(member)
     return any(getattr(permissions, name, False) for name in STAFF_PERMISSIONS)
 
 
@@ -369,6 +384,7 @@ class CGKOnboardingCog(commands.Cog, name="CGKOnboardingCog"):
                 result.failed.append((member.display_name, str(exc.text or exc)[:80]))
             else:
                 (result.created if created else result.reused).append(channel)
+                result.member_ids.append(member.id)
             if progress is not None and index % PROGRESS_EVERY == 0 and index < total:
                 try:
                     await progress(index, total)
@@ -381,6 +397,31 @@ class CGKOnboardingCog(commands.Cog, name="CGKOnboardingCog"):
             guild.id, len(result.created), len(result.reused), len(result.failed),
         )
         return result
+
+    # -- closing -----------------------------------------------
+    async def forget_channel(self, guild_id: int, channel_id: int) -> None:
+        """Drops a deleted channel, so tagging that member again opens a new one."""
+        await self.db.execute(
+            "UPDATE cgk_onboarding_members SET channel_id = NULL "
+            "WHERE guild_id = ? AND channel_id = ?",
+            (guild_id, channel_id),
+        )
+
+    async def close_ticket(
+        self, channel: discord.TextChannel, *, closed_by: discord.abc.User
+    ) -> None:
+        """Deletes a member's onboarding channel."""
+        await channel.delete(reason=f"Onboarding channel closed by {closed_by} ({closed_by.id})")
+        await self.forget_channel(channel.guild.id, channel.id)
+        logger.info("Onboarding channel %s closed by %s", channel.id, closed_by.id)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        """A channel deleted by hand in Discord is forgotten too."""
+        try:
+            await self.forget_channel(channel.guild.id, channel.id)
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            logger.warning("Could not forget deleted channel %s", channel.id, exc_info=True)
 
     # -- completion --------------------------------------------
     async def complete(self, member: discord.Member) -> bool:

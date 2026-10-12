@@ -32,7 +32,7 @@ from cogs.onboarding import DayGroup, missing_permissions
 from config import ONBOARDING_LOOKBACK_DAYS
 from utils import embed_builder
 from views.common import ack, missing_cog, replace_message, require_manage
-from views.creator_onboarding_view import CreatorWelcomeView, Shop101DoneView
+from views.creator_onboarding_view import OnboardingTicketView, Shop101DoneView
 
 logger = logging.getLogger("cgk_bot.cgk_onboarding_ui")
 
@@ -346,7 +346,7 @@ async def _execute_delivery(interaction: discord.Interaction, view: CGKComposerV
             members=members,
             moderator=interaction.user,
             batch_id=interaction.id,
-            view_factory=CreatorWelcomeView,
+            view_factory=OnboardingTicketView,
             progress=progress,
         )
     except (ValueError, discord.HTTPException) as exc:
@@ -453,6 +453,68 @@ class CGKSettingsView(discord.ui.View):
         self.stop()
 
 
+async def open_test_channel(interaction: discord.Interaction, member: discord.Member) -> None:
+    """
+    Opens (or re-tags) a private onboarding channel for one member as a test.
+
+    The member is not added to any tagged group, so scans still list them.
+    Expects the interaction to be deferred already; replies privately.
+    """
+    cog = _cog(interaction)
+    if cog is None:
+        await missing_cog(interaction, "CGK Onboarding")
+        return
+    settings = await cog.settings(interaction.guild.id)
+    problems = cog.setup_problems(interaction.guild, settings)
+    category = cog.category(interaction.guild, settings)
+    if category is None or any("Manage Channels" in problem for problem in problems):
+        await interaction.followup.send(
+            embed=embed_builder.error_embed("Fix the setup first", "\n".join(_problem_lines(problems))),
+            ephemeral=True,
+        )
+        return
+    try:
+        channel, created = await cog.open_ticket(
+            member, category, OnboardingTicketView(), batch_id=None, tagged_by=None
+        )
+    except CategoryFull:
+        await interaction.followup.send(
+            embed=embed_builder.error_embed(
+                "Could not open the test channel",
+                f"The **{category.name}** category is full ({CATEGORY_LIMIT} channels).",
+            ),
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            embed=embed_builder.error_embed("Could not open the test channel", str(exc)[:500]),
+            ephemeral=True,
+        )
+        return
+    yourself = member.id == interaction.user.id
+    who = "you" if yourself else member.mention
+    lines = [
+        embed_builder.item(
+            f"{'Opened' if created else 'Re-tagged ' + who + ' in'} {channel.mention}"
+            + (" — click through it like a new member would." if yourself else ".")
+        ),
+        embed_builder.item(
+            "Submitting the questionnaire really saves the answers for Slack and grants the access role."
+        ),
+        embed_builder.item(
+            "Not added to any tagged group. Press **🔒 Close onboarding** in the channel when done."
+        ),
+    ]
+    if problems:
+        lines += ["", *_problem_lines(problems)]
+    await interaction.followup.send(
+        embed=embed_builder.success_embed("Test channel ready", "\n".join(lines)),
+        ephemeral=True,
+        allowed_mentions=NO_MENTIONS,
+    )
+
+
 # ── Persistent hub ─────────────────────────────────────────────────────────
 async def build_cgk_hub_embed(interaction: discord.Interaction) -> discord.Embed:
     cog = _cog(interaction)
@@ -476,7 +538,7 @@ async def build_cgk_hub_embed(interaction: discord.Interaction) -> discord.Embed
         "\n".join(
             [
                 embed_builder.item(f"Waiting to be tagged: **{stats['pending']}**"),
-                embed_builder.item(f"Onboarding channels opened: **{stats['channels']}**"),
+                embed_builder.item(f"Open onboarding channels: **{stats['channels']}**"),
                 embed_builder.item(f"Finished onboarding: **{stats['completed']}**"),
             ]
         ),
@@ -498,7 +560,12 @@ async def build_cgk_hub_embed(interaction: discord.Interaction) -> discord.Embed
         *_problem_lines(problems),
         "",
         embed_builder.section("How to use it"),
-        embed_builder.item("**🧪 Test on myself** opens an onboarding channel for you to click through."),
+        embed_builder.item(
+            "**🧪 Test on myself** (or `/test-onboarding`) opens an onboarding channel to click through."
+        ),
+        embed_builder.item(
+            "**🔒 Close onboarding** in a channel lets the member or any moderator delete it."
+        ),
         embed_builder.item(
             "**🔍 Scan** groups recent members by join day — pick the days and "
             "press **Open onboarding channels**."
@@ -554,49 +621,7 @@ class CGKOnboardingHubView(discord.ui.View):
             await missing_cog(interaction, "CGK Onboarding")
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        settings = await cog.settings(interaction.guild.id)
-        problems = cog.setup_problems(interaction.guild, settings)
-        category = cog.category(interaction.guild, settings)
-        if category is None or any("Manage Channels" in problem for problem in problems):
-            await interaction.followup.send(
-                embed=embed_builder.error_embed("Fix the setup first", "\n".join(_problem_lines(problems))),
-                ephemeral=True,
-            )
-            return
-        try:
-            channel, created = await cog.open_ticket(
-                interaction.user, category, CreatorWelcomeView(), batch_id=None, tagged_by=None
-            )
-        except CategoryFull:
-            await interaction.followup.send(
-                embed=embed_builder.error_embed(
-                    "Could not open the test channel",
-                    f"The **{category.name}** category is full ({CATEGORY_LIMIT} channels).",
-                ),
-                ephemeral=True,
-            )
-            return
-        except discord.HTTPException as exc:
-            await interaction.followup.send(
-                embed=embed_builder.error_embed("Could not open the test channel", str(exc)[:500]),
-                ephemeral=True,
-            )
-            return
-        lines = [
-            embed_builder.item(
-                f"{'Opened' if created else 'Re-tagged you in'} {channel.mention} — click through it like a new member would."
-            ),
-            embed_builder.item(
-                "Submitting the questionnaire really saves your answers for Slack and grants the access role."
-            ),
-            embed_builder.item("You were not added to any tagged group. Delete the channel when you're done."),
-        ]
-        if problems:
-            lines += ["", *_problem_lines(problems)]
-        await interaction.followup.send(
-            embed=embed_builder.success_embed("Test channel ready", "\n".join(lines)),
-            ephemeral=True,
-        )
+        await open_test_channel(interaction, interaction.user)
 
     @discord.ui.button(
         label="Post Shop 101 checkpoint",
@@ -694,4 +719,5 @@ __all__ = [
     "build_cgk_hub_embed",
     "build_composer_embed",
     "build_settings_embed",
+    "open_test_channel",
 ]

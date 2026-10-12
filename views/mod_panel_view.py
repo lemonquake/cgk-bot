@@ -35,9 +35,11 @@ from views.plain_message_view import PlainMessageModal
 
 logger = logging.getLogger("cgk_bot.mod_panel_ui")
 
+FIELD_LIMIT = 1024
+
 FUNCTION_GUIDE = [
-    ("🎟️ CGK Onboarding", "Scan new members and open a private #handle-onboarding channel for each — finishing it unlocks the server. 🧪 Test it on yourself."),
-    ("👋 Onboarding", "Tag new members with the TikTok Shop creator question (✅ YES / ❌ NO). 🧪 Test it in any channel."),
+    ("🎟️ CGK Onboarding", "Scan new members and open a private #handle-onboarding channel for each — finishing it unlocks the server. 🧪 Test it on yourself (or /test-onboarding); 🔒 Close onboarding deletes a channel."),
+    ("👋 Onboarding", "Open a private channel for each new member and tag them there with the TikTok Shop creator question (✅ YES / ❌ NO). 🧪 Test it in any channel."),
     ("ℹ️ Information Onboarding", "Welcome new members with a tagged post and warm DM, plus the member questionnaire."),
     ("📊 Community Reports", "Growth reports that refresh themselves in a channel."),
     ("📈 Engagement Report", "Rank members by messages, reactions and threads."),
@@ -104,7 +106,7 @@ async def build_mod_panel_embed(
                     [
                         embed_builder.item(f"Waiting to be tagged: **{cgk_stats['pending']}**"),
                         embed_builder.item(
-                            f"Onboarding channels: **{cgk_stats['channels']}** · "
+                            f"Open onboarding channels: **{cgk_stats['channels']}** · "
                             f"finished: **{cgk_stats['completed']}**"
                         ),
                     ]
@@ -227,14 +229,22 @@ async def build_mod_panel_embed(
                 inline=False,
             )
 
-    embed.add_field(
-        name=embed_builder.section("What each button does"),
-        value="\n".join(
-            embed_builder.item(f"**{label}** — {description}")
-            for label, description in FUNCTION_GUIDE
-        ),
-        inline=False,
-    )
+    # A field holds at most 1024 characters, so the guide spills into more.
+    guide = [
+        embed_builder.item(f"**{label}** — {description}")
+        for label, description in FUNCTION_GUIDE
+    ]
+    chunks: list[list[str]] = [[]]
+    for line in guide:
+        if chunks[-1] and len("\n".join(chunks[-1] + [line])) > FIELD_LIMIT:
+            chunks.append([])
+        chunks[-1].append(line)
+    for index, chunk in enumerate(chunks):
+        embed.add_field(
+            name=embed_builder.section("What each button does") if index == 0 else "\u200b",
+            value="\n".join(chunk),
+            inline=False,
+        )
 
     embed.add_field(
         name=embed_builder.section("System health"),

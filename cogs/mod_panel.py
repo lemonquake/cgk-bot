@@ -8,6 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.questionnaire import publish_questionnaire
+from views.cgk_onboarding_view import open_test_channel
 from views.common import require_manage
 
 from views.engagement_contest_view import (
@@ -49,6 +50,26 @@ class ModPanelCog(commands.Cog):
         notice = await publish_questionnaire(interaction)
         embed = await build_hub_embed(interaction)
         await interaction.followup.send(content=notice, embed=embed, view=OnboardingHubView(), ephemeral=True)
+
+    @app_commands.command(
+        name="test-onboarding",
+        description="Open a private onboarding channel to test the flow (yourself or a member).",
+    )
+    @app_commands.describe(member="Who to onboard. Leave empty to test it on yourself.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def test_onboarding_command(
+        self, interaction: discord.Interaction, member: discord.Member | None = None
+    ):
+        """Opens a CGK onboarding channel without adding anyone to a tagged group."""
+        if not await require_manage(interaction):
+            return
+        target = member or interaction.user
+        if target.bot:
+            await interaction.response.send_message("Bots can't be onboarded.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await open_test_channel(interaction, target)
 
     @app_commands.command(
         name="community-report",

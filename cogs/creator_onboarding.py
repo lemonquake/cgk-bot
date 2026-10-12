@@ -2,11 +2,12 @@
 Creator onboarding engine: the "Are you a TikTok Shop creator?" welcome.
 Created by Aljay Leodones for CGK Linens.
 
-Works like Information Onboarding - scan for recent members, group them by
-join day, tag them in a chosen channel - but the post carries a ✅ YES /
-❌ NO question. In a shared channel every answer is answered privately
-(ephemeral); inside a member's own CGK Onboarding channel the replies are
-normal messages, so the conversation stays there for them.
+Scan for recent members, group them by join day, then open a private
+``#<handle>-onboarding`` channel for each (through CGK Onboarding) and tag
+them there with a ✅ YES / ❌ NO question. Inside a member's own channel the
+replies are normal messages, so the conversation - and any question they
+type for the team - stays there. A 🧪 test post in a shared channel answers
+privately (ephemeral) instead.
 
 It keeps its own onboarding log, so members already welcomed by
 Information Onboarding still show up here.
@@ -111,12 +112,15 @@ CHANNEL_SETTINGS = {
     "opportunities": "creator_opportunities_channel_id",
 }
 CHANNEL_LABELS = {
-    "welcome": "Default welcome channel",
+    "welcome": "Default test channel",
     "getting_started": "Getting-started channel",
     "opportunities": "Opportunities channel",
 }
 CHANNEL_HINTS = {
-    "welcome": "Pre-selected for every creator welcome (you can still pick another).",
+    "welcome": (
+        "Pre-selected for 🧪 Test message. Real welcomes go to each member's "
+        "private onboarding channel."
+    ),
     "getting_started": (
         f"Where 🌱 learning creators are sent (#{GETTING_STARTED_NAME} unless you pick another)."
     ),
