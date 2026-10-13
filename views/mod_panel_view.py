@@ -32,6 +32,7 @@ from views.onboarding_view import (
     open_questionnaire_poster,
 )
 from views.plain_message_view import PlainMessageModal
+from views.role_giver_view import open_role_giver
 
 logger = logging.getLogger("cgk_bot.mod_panel_ui")
 
@@ -48,6 +49,7 @@ FUNCTION_GUIDE = [
     ("📝 Embed Message", "Compose, save and reuse branded embeds — templates included."),
     ("💬 Normal Message", "Write a plain message, preview it, edit it, attach images, then post."),
     ("📋 Post Questionnaire", "Post the member questionnaire (Start onboarding) in any channel, as many times as you like."),
+    ("👥 Role Giver", "Assign a role to all members in bulk, with filters to exclude bots, admins, or other roles."),
     ("🔄 Refresh Dashboard", "Reload this panel with the latest data and buttons."),
 ]
 
@@ -472,7 +474,22 @@ class ModPanelView(discord.ui.View):
             return
         await open_questionnaire_poster(interaction)
 
-    # ── Row 3: maintenance ────────────────────────────────────
+    # ── Row 3: tools & maintenance ────────────────────────────
+    @discord.ui.button(
+        label="Role Giver",
+        style=discord.ButtonStyle.primary,
+        custom_id="cgk_mod_panel:role_giver",
+        emoji="👥",
+        row=3,
+    )
+    async def role_giver_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        """Opens the Role Giver tool to assign roles in bulk with filters."""
+        if not await require_manage(interaction):
+            return
+        await open_role_giver(interaction)
+
     @discord.ui.button(
         label="Refresh Dashboard",
         style=discord.ButtonStyle.secondary,

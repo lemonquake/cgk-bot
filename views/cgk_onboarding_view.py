@@ -75,23 +75,53 @@ class CGKDraft:
     last_group: TaggedGroup | None
     problems: list[str]
     selected_keys: set[str] = field(default_factory=lambda: {"all"})
+    selected_member_id: int | None = None
     notice: tuple[str, str] | None = None
 
     def apply_selection(self, keys: set[str]) -> None:
+        self.selected_member_id = None
         self.selected_keys = {"all"} if not keys or "all" in keys else keys
+
+    def select_single_member(self, member_id: int | None) -> None:
+        self.selected_member_id = member_id
 
     def is_active(self, key: str) -> bool:
         return "all" in self.selected_keys or key in self.selected_keys
 
     @property
+    def all_pending_members(self) -> list[discord.Member]:
+        seen: set[int] = set()
+        result: list[discord.Member] = []
+        for group in self.groups:
+            for member in group.members:
+                if member.id not in seen:
+                    seen.add(member.id)
+                    result.append(member)
+        return sorted(
+            result,
+            key=lambda m: getattr(m, "joined_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+
+    @property
     def selected_members(self) -> list[discord.Member]:
+        if self.selected_member_id is not None:
+            for member in self.all_pending_members:
+                if member.id == self.selected_member_id:
+                    return [member]
+            self.selected_member_id = None
+
         unique: dict[int, discord.Member] = {
             member.id: member
             for group in self.groups
             if self.is_active(group.key)
             for member in group.members
         }
-        return sorted(unique.values(), key=lambda m: m.joined_at, reverse=True)
+        return sorted(
+            unique.values(),
+            key=lambda m: getattr(m, "joined_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
 
     def inform(self, message: str, level: str = "info") -> None:
         self.notice = (level, message)
@@ -110,27 +140,44 @@ def build_composer_embed(draft: CGKDraft, guild: discord.Guild) -> discord.Embed
         lines += [f"{NOTICE_STYLES.get(level, 'ℹ️')} {text}", embed_builder.SEPARATOR]
 
     if draft.groups:
-        names = [member.display_name for member in members[:12]]
-        preview = ", ".join(names) if names else "No members selected yet"
-        if len(members) > 12:
-            preview += f" … and {len(members) - 12} more"
-        lines += [
-            embed_builder.section("Members") + f" **{len(members)}** selected",
-            preview,
-            "",
-            "\n".join(
-                embed_builder.item(
-                    f"**{group.label}** — {len(group.members)}"
-                    + ("  ✅" if draft.is_active(group.key) else "")
-                )
-                for group in draft.groups
-            ),
-        ]
+        if draft.selected_member_id is not None and members:
+            target = members[0]
+            joined_text = (
+                f" · Joined <t:{int(target.joined_at.timestamp())}:R>"
+                if getattr(target, "joined_at", None)
+                else ""
+            )
+            lines += [
+                embed_builder.section("Single member mode") + " **1** member selected",
+                embed_builder.item(f"Target: **{target.display_name}** ({target.mention}){joined_text}"),
+                embed_builder.item(f"Member ID: `{target.id}`"),
+                "",
+                "*(Only this single member will have an onboarding channel opened. "
+                "Select 'None' in the member menu or pick a join day to switch back)*",
+            ]
+        else:
+            names = [member.display_name for member in members[:12]]
+            preview = ", ".join(names) if names else "No members selected yet"
+            if len(members) > 12:
+                preview += f" … and {len(members) - 12} more"
+            lines += [
+                embed_builder.section("Members") + f" **{len(members)}** selected",
+                preview,
+                "",
+                "\n".join(
+                    embed_builder.item(
+                        f"**{group.label}** — {len(group.members)}"
+                        + ("  ✅" if draft.is_active(group.key) else "")
+                    )
+                    for group in draft.groups
+                ),
+            ]
     else:
         lines.append(
             f"✅ Everyone who joined in the last {ONBOARDING_LOOKBACK_DAYS} days "
             "has been tagged (or already has access)."
         )
+
 
     lines += [
         "",
@@ -195,7 +242,7 @@ class CGKDaySelect(discord.ui.Select):
                 value="all",
                 emoji="✅",
                 description=f"All members from the last {ONBOARDING_LOOKBACK_DAYS} days",
-                default="all" in draft.selected_keys,
+                default="all" in draft.selected_keys and draft.selected_member_id is None,
             )
         ]
         for group in draft.groups[:24]:
@@ -205,7 +252,7 @@ class CGKDaySelect(discord.ui.Select):
                     value=group.key,
                     emoji="📅",
                     description=group.description[:100],
-                    default=group.key in draft.selected_keys,
+                    default=group.key in draft.selected_keys and draft.selected_member_id is None,
                 )
             )
         super().__init__(
@@ -222,14 +269,122 @@ class CGKDaySelect(discord.ui.Select):
         await render_composer(interaction, draft)
 
 
+class CGKSingleMemberSelect(discord.ui.Select):
+    """Select a specific single member from the new members list to onboard."""
+
+    def __init__(self, draft: CGKDraft):
+        pending = draft.all_pending_members
+        options = [
+            discord.SelectOption(
+                label="None (use join days above)",
+                value="none",
+                emoji="↩️",
+                description="Onboard members based on the join days selected above",
+                default=draft.selected_member_id is None,
+            )
+        ]
+        for member in pending[:24]:
+            joined_str = (
+                member.joined_at.strftime("%b %d, %H:%M")
+                if getattr(member, "joined_at", None)
+                else "recently"
+            )
+            name_tag = getattr(member, "name", getattr(member, "display_name", str(member.id)))
+            disp_name = getattr(member, "display_name", str(member.id))
+            options.append(
+                discord.SelectOption(
+                    label=disp_name[:100],
+                    value=str(member.id),
+                    emoji="👤",
+                    description=f"@{name_tag} · Joined {joined_str}"[:100],
+                    default=draft.selected_member_id == member.id,
+                )
+            )
+
+        super().__init__(
+            placeholder="Or onboard a single member from the list...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        draft: CGKDraft = self.view.draft  # type: ignore[attr-defined]
+        chosen = self.values[0]
+        if chosen == "none":
+            draft.select_single_member(None)
+        else:
+            draft.select_single_member(int(chosen))
+        await render_composer(interaction, draft)
+
+
+class CGKComposerMemberPickerView(discord.ui.View):
+    """Allows searching and selecting any member for single-member onboarding."""
+
+    def __init__(self, draft: CGKDraft, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.draft = draft
+
+    @discord.ui.select(
+        cls=discord.ui.UserSelect,
+        placeholder="Search for a member to onboard...",
+        min_values=1,
+        max_values=1,
+        row=0,
+    )
+    async def select_user(
+        self, interaction: discord.Interaction, select: discord.ui.UserSelect
+    ) -> None:
+        if not await require_manage(interaction):
+            return
+        if not select.values:
+            return
+        user = select.values[0]
+        member = interaction.guild.get_member(user.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(user.id)
+            except (discord.NotFound, discord.HTTPException):
+                await interaction.response.send_message(
+                    "That member could not be found in this server.", ephemeral=True
+                )
+                return
+        if member.bot:
+            await interaction.response.send_message(
+                "Bots can't be onboarded.", ephemeral=True
+            )
+            return
+
+        self.draft.select_single_member(member.id)
+        pending_ids = {m.id for m in self.draft.all_pending_members}
+        if member.id not in pending_ids:
+            self.draft.groups.insert(0, DayGroup("custom", "Selected member", "", [member]))
+
+        self.draft.inform(f"Selected **{member.display_name}** for single-member onboarding.", "success")
+        await render_composer(interaction, self.draft)
+
+    @discord.ui.button(label="Back to scan", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await render_composer(interaction, self.draft)
+
+
 class CGKComposerView(discord.ui.View):
     def __init__(self, draft: CGKDraft):
         super().__init__(timeout=COMPOSER_TIMEOUT)
         self.draft = draft
         if draft.groups:
             self.add_item(CGKDaySelect(draft))
+            if draft.all_pending_members:
+                self.add_item(CGKSingleMemberSelect(draft))
         count = len(draft.selected_members)
-        self.send.label = f"Open {count} onboarding channel{'s' if count != 1 else ''}"
+        if draft.selected_member_id is not None and count == 1:
+            member = draft.selected_members[0]
+            disp = getattr(member, "display_name", str(member.id))
+            self.send.label = f"Open onboarding for {disp[:20]}"
+        else:
+            self.send.label = f"Open {count} onboarding channel{'s' if count != 1 else ''}"
+
         self.send.disabled = count == 0 or bool(draft.problems)
         self.clear_and_rescan.disabled = draft.last_group is None
 
@@ -245,16 +400,32 @@ class CGKComposerView(discord.ui.View):
             return False
         return await require_manage(interaction)
 
-    @discord.ui.button(label="Open onboarding channels", style=discord.ButtonStyle.success, emoji="🎟️", row=1)
+    @discord.ui.button(label="Open onboarding channels", style=discord.ButtonStyle.success, emoji="🎟️", row=2)
     async def send(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await ack(interaction)
         await _execute_delivery(interaction, self)
+
+    @discord.ui.button(label="Find member", style=discord.ButtonStyle.secondary, emoji="🔍", row=2)
+    async def search_member(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_manage(interaction):
+            return
+        await replace_message(
+            interaction,
+            embed_builder.base_embed(
+                title="🔍  Select a Member to Onboard",
+                description=(
+                    f"{embed_builder.SEPARATOR}\n"
+                    "Search and select any member to onboard individually in a private channel."
+                ),
+            ),
+            CGKComposerMemberPickerView(self.draft),
+        )
 
     @discord.ui.button(
         label="Clear last tagged group & rescan",
         style=discord.ButtonStyle.secondary,
         emoji="♻️",
-        row=1,
+        row=2,
     )
     async def clear_and_rescan(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await ack(interaction)
@@ -271,12 +442,13 @@ class CGKComposerView(discord.ui.View):
         )
         await render_composer(interaction, draft)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️", row=1)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️", row=2)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await replace_message(
             interaction, embed_builder.info_embed("Cancelled", "Nothing was sent."), None
         )
         self.stop()
+
 
     async def on_error(
         self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item
@@ -458,12 +630,14 @@ async def open_test_channel(interaction: discord.Interaction, member: discord.Me
     Opens (or re-tags) a private onboarding channel for one member as a test.
 
     The member is not added to any tagged group, so scans still list them.
-    Expects the interaction to be deferred already; replies privately.
+    Replies privately.
     """
     cog = _cog(interaction)
     if cog is None:
         await missing_cog(interaction, "CGK Onboarding")
         return
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
     settings = await cog.settings(interaction.guild.id)
     problems = cog.setup_problems(interaction.guild, settings)
     category = cog.category(interaction.guild, settings)
@@ -515,6 +689,55 @@ async def open_test_channel(interaction: discord.Interaction, member: discord.Me
     )
 
 
+class CGKTestMemberSelectView(discord.ui.View):
+    """Allows a moderator to select any member to test the onboarding flow."""
+
+    def __init__(self, timeout: float = 300):
+        super().__init__(timeout=timeout)
+
+    @discord.ui.select(
+        cls=discord.ui.UserSelect,
+        placeholder="Select a member to test onboarding on...",
+        min_values=1,
+        max_values=1,
+        row=0,
+    )
+    async def select_member(
+        self, interaction: discord.Interaction, select: discord.ui.UserSelect
+    ) -> None:
+        if not await require_manage(interaction):
+            return
+        if not select.values:
+            return
+        user = select.values[0]
+        member = interaction.guild.get_member(user.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(user.id)
+            except (discord.NotFound, discord.HTTPException):
+                await interaction.response.send_message(
+                    "That member could not be found in this server.", ephemeral=True
+                )
+                return
+        if member.bot:
+            await interaction.response.send_message(
+                "Bots can't be onboarded.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await open_test_channel(interaction, member)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️", row=1)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await replace_message(
+            interaction, embed_builder.info_embed("Cancelled", "Test onboarding was cancelled."), None
+        )
+        self.stop()
+
+
 # ── Persistent hub ─────────────────────────────────────────────────────────
 async def build_cgk_hub_embed(interaction: discord.Interaction) -> discord.Embed:
     cog = _cog(interaction)
@@ -561,14 +784,13 @@ async def build_cgk_hub_embed(interaction: discord.Interaction) -> discord.Embed
         "",
         embed_builder.section("How to use it"),
         embed_builder.item(
-            "**🧪 Test on myself** (or `/test-onboarding`) opens an onboarding channel to click through."
+            "**🧪 Test on myself / member** (or `/test-onboarding`) opens a test channel to click through."
         ),
         embed_builder.item(
             "**🔒 Close onboarding** in a channel lets the member or any moderator delete it."
         ),
         embed_builder.item(
-            "**🔍 Scan** groups recent members by join day — pick the days and "
-            "press **Open onboarding channels**."
+            "**🔍 Scan** groups recent members by join day — or select a **single member** to onboard individually."
         ),
         embed_builder.item(
             "**📌 Post Shop 101 checkpoint** adds an *I've finished TikTok Shop 101* "
@@ -607,6 +829,43 @@ class CGKOnboardingHubView(discord.ui.View):
         )
 
     @discord.ui.button(
+        label="Onboard single member",
+        style=discord.ButtonStyle.success,
+        custom_id="cgk_onboarding_hub:single_member",
+        emoji="👤",
+        row=0,
+    )
+    async def single_member(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_manage(interaction):
+            return
+        if _cog(interaction) is None:
+            await missing_cog(interaction, "CGK Onboarding")
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        draft = await _draft_for(interaction, interaction.user.id)
+        if not draft.all_pending_members:
+            await interaction.followup.send(
+                embed=embed_builder.info_embed(
+                    "No pending new members",
+                    f"Everyone who joined in the last {ONBOARDING_LOOKBACK_DAYS} days "
+                    "has already been tagged or finished onboarding.",
+                ),
+                ephemeral=True,
+            )
+            return
+        draft.select_single_member(draft.all_pending_members[0].id)
+        draft.inform(
+            f"Selected **{draft.all_pending_members[0].display_name}**. Use the dropdown to choose another member.",
+            "info",
+        )
+        await interaction.followup.send(
+            embed=build_composer_embed(draft, interaction.guild),
+            view=CGKComposerView(draft),
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    @discord.ui.button(
         label="Test on myself",
         style=discord.ButtonStyle.primary,
         custom_id="cgk_onboarding_hub:test",
@@ -624,11 +883,40 @@ class CGKOnboardingHubView(discord.ui.View):
         await open_test_channel(interaction, interaction.user)
 
     @discord.ui.button(
+        label="Test on member",
+        style=discord.ButtonStyle.primary,
+        custom_id="cgk_onboarding_hub:test_member",
+        emoji="🧪",
+        row=0,
+    )
+    async def test_member(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_manage(interaction):
+            return
+        cog = _cog(interaction)
+        if cog is None:
+            await missing_cog(interaction, "CGK Onboarding")
+            return
+        embed = embed_builder.base_embed(
+            title="🧪  Test CGK Onboarding on a Member",
+            description=(
+                f"{embed_builder.SEPARATOR}\n"
+                "Select any member from the menu below to open a private test onboarding "
+                "channel for them without adding them to a tagged group.\n\n"
+                f"{embed_builder.item('A private **#<handle>-onboarding** channel will be opened.')}\n"
+                f"{embed_builder.item('They will be tagged with the creator questions.')}\n"
+                f"{embed_builder.item('Use **🔒 Close onboarding** inside the channel when finished.')}"
+            ),
+        )
+        await interaction.response.send_message(
+            embed=embed, view=CGKTestMemberSelectView(), ephemeral=True
+        )
+
+    @discord.ui.button(
         label="Post Shop 101 checkpoint",
         style=discord.ButtonStyle.secondary,
         custom_id="cgk_onboarding_hub:checkpoint",
         emoji="📌",
-        row=0,
+        row=1,
     )
     async def checkpoint(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await require_manage(interaction):
@@ -712,12 +1000,16 @@ class CGKOnboardingHubView(discord.ui.View):
 
 
 __all__ = [
+    "CGKComposerMemberPickerView",
     "CGKComposerView",
     "CGKDraft",
     "CGKOnboardingHubView",
     "CGKSettingsView",
+    "CGKSingleMemberSelect",
+    "CGKTestMemberSelectView",
     "build_cgk_hub_embed",
     "build_composer_embed",
     "build_settings_embed",
     "open_test_channel",
 ]
+

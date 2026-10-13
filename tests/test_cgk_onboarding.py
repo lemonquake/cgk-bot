@@ -451,7 +451,9 @@ class ComposerTests(unittest.TestCase):
                 {child.custom_id for child in hub.children},
                 {
                     "cgk_onboarding_hub:scan",
+                    "cgk_onboarding_hub:single_member",
                     "cgk_onboarding_hub:test",
+                    "cgk_onboarding_hub:test_member",
                     "cgk_onboarding_hub:checkpoint",
                     "cgk_onboarding_hub:settings",
                     "cgk_onboarding_hub:stats",
@@ -460,6 +462,38 @@ class ComposerTests(unittest.TestCase):
 
         asyncio.run(check())
 
+    def test_single_member_selection_in_draft(self):
+        member1 = SimpleNamespace(id=1, display_name="Ann", joined_at=datetime.now(timezone.utc))
+        member2 = SimpleNamespace(id=2, display_name="Bob", joined_at=datetime.now(timezone.utc))
+        draft = CGKDraft(
+            user_id=7,
+            groups=[DayGroup("d0", "Joined today", "", [member1, member2])],
+            settings=CGKSettings(CATEGORY_ID, ROLE_ID, {"category": "env", "role": "env"}),
+            last_group=None,
+            problems=[],
+        )
+        self.assertEqual(len(draft.selected_members), 2)
+        draft.select_single_member(2)
+        self.assertEqual(len(draft.selected_members), 1)
+        self.assertEqual(draft.selected_members[0].id, 2)
+
+        view = CGKComposerView(draft)
+        self.assertEqual(view.send.label, "Open onboarding for Bob")
+
+        # Switching back to day selection clears single member mode
+        draft.apply_selection({"all"})
+        self.assertIsNone(draft.selected_member_id)
+        self.assertEqual(len(draft.selected_members), 2)
+
+    def test_test_member_select_view(self):
+        from views.cgk_onboarding_view import CGKTestMemberSelectView
+
+        view = CGKTestMemberSelectView()
+        self.assertEqual(len(view.children), 2)
+        self.assertTrue(any(isinstance(c, discord.ui.UserSelect) for c in view.children))
+        self.assertTrue(any(isinstance(c, discord.ui.Button) for c in view.children))
+
 
 if __name__ == "__main__":
     unittest.main()
+

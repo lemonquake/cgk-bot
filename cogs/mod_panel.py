@@ -18,6 +18,7 @@ from views.engagement_contest_view import (
 from views.member_report_view import MemberReportHubView, build_report_hub_embed
 from views.mod_panel_view import ModPanelView, build_mod_panel_embed
 from views.onboarding_view import OnboardingHubView, build_hub_embed
+from views.role_giver_view import open_role_giver
 
 
 class ModPanelCog(commands.Cog):
@@ -96,7 +97,19 @@ class ModPanelCog(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.command(
+        name="role-giver",
+        description="Assign a role to all members in bulk with custom exclusion filters.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def role_giver_command(self, interaction: discord.Interaction):
+        """Opens the Role Giver hub (also reachable from /summon)."""
+        if not await require_manage(interaction):
+            return
+        await open_role_giver(interaction)
+
 
 async def setup(bot: commands.Bot):
+
     """Adds the ModPanelCog to the bot."""
     await bot.add_cog(ModPanelCog(bot))
