@@ -24,3 +24,10 @@ Thumbs.db
 # IDE configuration
 .vscode/
 .idea/
+
+# Artifacts and outputs
+outputs/
+data.txt
+Slack to Sheets.txt
+Zapier.txt
+zapier_prompt/

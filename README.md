@@ -22,6 +22,16 @@ Three systems power it:
 
 All of it is driven from the Mod Panel — no commands to memorise.
 
+Use **Onboarding Channel** in the Mod Panel to select a text channel and post
+the **START MY ONBOARDING** button with instructions for members. The button
+opens the member's private onboarding channel, or returns them to their existing
+channel, and continues the original onboarding flow. Posted buttons work after
+bot restarts. After the questionnaire is successfully saved, the bot grants the
+configured access role and removes the **Onboarding** role
+(`1559649034598227968`). The bot needs **Manage Roles** and a role above
+both roles. Refresh an existing Mod Panel with **Refresh Dashboard** to see
+the new control after restarting the bot.
+
 ---
 
 ## Step-by-Step Installation & Setup Guide
@@ -199,7 +209,7 @@ What each member gets:
   [🔒 Close onboarding]
 ```
 
-**Closing a channel:** the member or any moderator can press **🔒 Close onboarding** on the first message. After a quick "are you sure?" the bot deletes the channel. A channel a moderator deletes by hand in Discord is forgotten the same way, and tagging that member again opens a fresh channel.
+**Closing a channel:** only moderators with role ID `1542915539872125049` can use **🔒 Close onboarding** on the first message. Members cannot close their own channels. After confirmation, the bot deletes the channel. A channel a moderator deletes by hand in Discord is forgotten the same way, and tagging that member again opens a fresh channel.
 
 Only the channel's member can answer in it. Submitting the questionnaire grants the access role, then posts *"You now have full access to the CGK creator community! Head to #opportunities-to-earn …"* in the channel. That completes the workflow. If the role can't be granted, the post says so instead, and a moderator can add it by hand. A category holds at most **50** channels, so close finished onboarding channels from time to time.
 
@@ -489,7 +499,7 @@ Created by **Aljay Leodones** for **CGK Linens**.
 
 ## Member questionnaire and Slack responses
 
-Use `/onboarding` or the mod panel Onboarding button to publish the member form in Introduce Yourself. The five questions collect TikTok handle, email, phone number, last 30 days TikTok GMV, and an optional birthday. The member's Discord account is captured automatically. Responses are saved locally and sent to the brand's private Slack channel.
+Use `/onboarding` or the mod panel Onboarding button to publish the member form in Introduce Yourself. The three required questions collect TikTok handle, email, and phone number. The member's Discord account is captured automatically. Responses are saved locally and sent to the brand's private Slack channel.
 
 To post the form somewhere else too, open **ℹ️ Information Onboarding** and press **Post questionnaire**, pick any channel and press **📝 Post questionnaire**. Press it again for another copy or pick another channel — every copy works the same and survives restarts.
 

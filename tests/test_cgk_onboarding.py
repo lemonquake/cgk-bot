@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import asyncio
 import unittest
+from unittest.mock import AsyncMock
 
 import discord
 
@@ -34,7 +35,7 @@ from views.cgk_onboarding_view import (
     CGKOnboardingHubView,
     build_composer_embed,
 )
-from views.creator_onboarding_view import OnboardingTicketView
+from views.creator_onboarding_view import CloseConfirmView, OnboardingTicketView, ask_to_close
 
 GUILD_ID = 1
 ROLE_ID = 700
@@ -127,6 +128,14 @@ class FakeMember:
         self.joined_at = datetime.now(timezone.utc) - timedelta(days=days_ago, hours=1)
         self.added = []
         self.fail_add = False
+        self.removed = []
+        self.fail_remove = False
+
+    async def remove_roles(self, role, reason=None):
+        if self.fail_remove:
+            raise discord.Forbidden(SimpleNamespace(status=403, reason="no"), "no")
+        self.removed.append(role)
+        self.roles.remove(role)
 
     async def add_roles(self, role, reason=None):
         if self.fail_add:
@@ -187,17 +196,19 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(owner_from_topic("General chat"))
         self.assertIsNone(owner_from_topic(None))
 
-    def test_owner_or_moderators_can_close(self):
-        def channel(permissions):
-            return SimpleNamespace(permissions_for=lambda member: permissions)
-
-        member = SimpleNamespace(id=42)
-        nobody = discord.Permissions.none()
-        self.assertTrue(can_close(member, channel(nobody), 42))
-        self.assertFalse(can_close(SimpleNamespace(id=7), channel(nobody), 42))
-        mod = channel(discord.Permissions(manage_messages=True))
-        self.assertTrue(can_close(SimpleNamespace(id=7), mod, 42))
-        self.assertFalse(can_close(member, mod, None))  # not an onboarding channel
+    def test_only_designated_moderator_role_can_close(self):
+        channel = SimpleNamespace(permissions_for=lambda member: discord.Permissions.all())
+        owner = SimpleNamespace(id=42, roles=[])
+        moderator = SimpleNamespace(id=7, roles=[SimpleNamespace(id=1542915539872125049)])
+        wrong_role = SimpleNamespace(id=8, roles=[SimpleNamespace(id=1549415196123074581)])
+        self.assertEqual(cgk.ONBOARDING_MODERATOR_ROLE_ID, 1542915539872125049)
+        self.assertFalse(can_close(owner, channel, 42))
+        self.assertFalse(can_close(SimpleNamespace(id=7), channel, 42))
+        self.assertFalse(can_close(wrong_role, channel, 42))
+        self.assertTrue(can_close(moderator, channel, 42))
+        self.assertFalse(can_close(moderator, channel, None))
+        owner.roles = moderator.roles
+        self.assertTrue(can_close(owner, channel, 42))  # authorized by role, not ownership
 
     def test_only_member_staff_and_bot_can_see_the_channel(self):
         guild = FakeGuild()
@@ -221,6 +232,7 @@ class CGKTestCase(unittest.IsolatedAsyncioTestCase):
         self.cog = CGKOnboardingCog.__new__(CGKOnboardingCog)
         self.cog.bot = None
         self.cog.db = self.db
+        self.cog._self_service_lock = asyncio.Lock()
         self._pace = cgk.CREATE_PACE_SECONDS
         cgk.CREATE_PACE_SECONDS = 0
         self._defaults = dict(cgk.ENV_DEFAULTS)
@@ -333,16 +345,140 @@ class TicketTests(CGKTestCase):
 
     async def test_pending_skips_tagged_and_members_with_access(self):
         guild = FakeGuild()
-        fresh = FakeMember(guild, 1, "ann")
-        has_access = FakeMember(guild, 2, "bob", roles=[guild.access_role])
-        tagged = FakeMember(guild, 3, "cat")
-        old = FakeMember(guild, 4, "dan", days_ago=400)
-        guild.members = [fresh, has_access, tagged, old]
+        onboarding = FakeRole(cgk.ONBOARDING_PENDING_ROLE_ID, 3)
+        guild.roles.append(onboarding)
+        fresh = FakeMember(guild, 1, "ann", roles=[onboarding])
+        has_access = FakeMember(guild, 2, "bob", roles=[onboarding, guild.access_role])
+        tagged = FakeMember(guild, 3, "cat", roles=[onboarding])
+        old = FakeMember(guild, 4, "dan", days_ago=400, roles=[onboarding])
+        no_onboarding_role = FakeMember(guild, 5, "eve")
+        guild.members = [fresh, has_access, tagged, old, no_onboarding_role]
         await self.deliver(guild, [tagged], batch_id=1)
         self.assertEqual([m.id for m in await self.cog.pending_members(guild)], [1])
 
 
 class CompletionTests(CGKTestCase):
+    async def test_form_only_updates_roles_after_valid_answers_are_saved(self):
+        from views.creator_onboarding_view import CreatorQuestionnaireModal
+
+        for index, (valid, save_error, saved) in enumerate([
+            (True, False, True),
+            (True, False, False),  # Existing saved answers can retry role updates.
+            (False, False, True),
+            (True, True, True),
+        ]):
+            with self.subTest(valid=valid, save_error=save_error, saved=saved):
+                guild = FakeGuild()
+                pending = FakeRole(cgk.ONBOARDING_PENDING_ROLE_ID, 3)
+                guild.roles.append(pending)
+                member = FakeMember(guild, 42 + index, "lemon", roles=[pending])
+                questionnaire = SimpleNamespace(save_answers=AsyncMock(return_value=saved))
+                if save_error:
+                    questionnaire.save_answers.side_effect = RuntimeError("database unavailable")
+                cogs = {"CGKOnboardingCog": self.cog, "QuestionnaireCog": questionnaire}
+                interaction = SimpleNamespace(
+                    user=member, guild=guild, channel=None,
+                    client=SimpleNamespace(get_cog=cogs.get),
+                    response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+                    followup=SimpleNamespace(send=AsyncMock()),
+                )
+                modal = CreatorQuestionnaireModal(member)
+                values = dict(
+                    tt_handle="@lemon", email="lemon@example.com" if valid else "invalid",
+                    phone="+1 555 123 4567", gmv="USD 0", birthday="",
+                )
+                modal.inputs = {key: SimpleNamespace(value=value) for key, value in values.items()}
+                with unittest.mock.patch.object(discord, "Member", FakeMember):
+                    await modal.on_submit(interaction)
+                completed = valid and not save_error
+                self.assertEqual(member.removed, [pending] if completed else [])
+                self.assertEqual(member.added, [guild.access_role] if completed else [])
+                if not valid:
+                    questionnaire.save_answers.assert_not_awaited()
+
+    async def test_completion_removes_only_this_servers_onboarding_role(self):
+        self.assertEqual(cgk.ONBOARDING_PENDING_ROLE_ID, 1559649034598227968)
+        guild = FakeGuild()
+        pending = FakeRole(cgk.ONBOARDING_PENDING_ROLE_ID, 3)
+        other = FakeRole(1559650120621105182, 3)
+        guild.roles.extend([pending, other])
+        member = FakeMember(guild, 42, "lemon", roles=[pending, other])
+        self.assertTrue(await self.cog.complete(member))
+        self.assertEqual(member.added, [guild.access_role])
+        self.assertEqual(member.removed, [pending])
+        self.assertIn(other, member.roles)
+        self.assertTrue(await self.cog.complete(member))
+        self.assertEqual(member.removed, [pending])
+        self.assertEqual(member.added, [guild.access_role])
+
+    async def test_existing_access_role_still_removes_onboarding_role(self):
+        guild = FakeGuild()
+        pending = FakeRole(cgk.ONBOARDING_PENDING_ROLE_ID, 3)
+        guild.roles.append(pending)
+        member = FakeMember(guild, 42, "lemon", roles=[pending, guild.access_role])
+        self.assertTrue(await self.cog.complete(member))
+        self.assertEqual(member.added, [])
+        self.assertEqual(member.removed, [pending])
+
+    async def test_access_failure_preserves_onboarding_role_and_completion(self):
+        guild = FakeGuild()
+        pending = FakeRole(cgk.ONBOARDING_PENDING_ROLE_ID, 3)
+        guild.roles.append(pending)
+        member = FakeMember(guild, 42, "lemon", roles=[pending])
+        member.fail_add = True
+        self.assertFalse(await self.cog.complete(member))
+        self.assertEqual(member.removed, [])
+        row = await self.db.fetchone(
+            "SELECT completed_at FROM cgk_onboarding_members WHERE user_id=? AND guild_id=?",
+            (42, GUILD_ID),
+        )
+        self.assertIsNone(row)
+
+    async def test_removal_failure_can_retry_without_granting_access_twice(self):
+        guild = FakeGuild()
+        pending = FakeRole(cgk.ONBOARDING_PENDING_ROLE_ID, 3)
+        guild.roles.append(pending)
+        member = FakeMember(guild, 42, "lemon", roles=[pending])
+        member.fail_remove = True
+        self.assertFalse(await self.cog.complete(member))
+        row = await self.db.fetchone(
+            "SELECT completed_at FROM cgk_onboarding_members WHERE user_id=? AND guild_id=?",
+            (42, GUILD_ID),
+        )
+        self.assertIsNone(row)
+        member.fail_remove = False
+        self.assertTrue(await self.cog.complete(member))
+        self.assertEqual(member.added, [guild.access_role])
+        self.assertEqual(member.removed, [pending])
+
+    async def test_pending_role_cannot_be_configured_as_access_role(self):
+        guild = FakeGuild()
+        pending = FakeRole(cgk.ONBOARDING_PENDING_ROLE_ID, 3)
+        guild.roles.append(pending)
+        await self.cog.set_value(GUILD_ID, "role", pending.id)
+        member = FakeMember(guild, 42, "lemon", roles=[pending])
+        self.assertFalse(await self.cog.complete(member))
+        self.assertIn(pending, member.roles)
+
+    async def test_self_service_clicks_create_one_channel_and_preserve_progress(self):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        results = await asyncio.gather(*[
+            self.cog.start_self_service(member, guild.category_channel, view_factory())
+            for _ in range(3)
+        ])
+        self.assertEqual(len(guild.created), 1)
+        self.assertEqual([created for _, created in results], [True, False, False])
+        self.assertEqual(len(guild.created[0].sent), 1)
+        self.assertEqual(member.added, [])
+        row = await self.db.fetchone(
+            "SELECT completed_at, batch_id, tagged_by FROM cgk_onboarding_members WHERE user_id=? AND guild_id=?",
+            (42, GUILD_ID),
+        )
+        self.assertIsNone(row["completed_at"])
+        self.assertIsNone(row["batch_id"])
+        self.assertIsNone(row["tagged_by"])
+
     async def test_grants_role_and_counts_completion(self):
         guild = FakeGuild()
         member = FakeMember(guild, 42, "lemon")
@@ -371,13 +507,79 @@ class CloseTests(CGKTestCase):
         member = FakeMember(guild, 42, "lemon")
         await self.deliver(guild, [member], batch_id=1)
         channel = guild.created[0]
-        await self.cog.close_ticket(channel, closed_by=member)
-        self.assertIn("closed by lemon", channel.deleted)
+        moderator = FakeMember(guild, 7, "moderator", roles=[FakeRole(1542915539872125049, 4)])
+        await self.cog.close_ticket(channel, closed_by=moderator)
+        self.assertIn("closed by moderator", channel.deleted)
         self.assertEqual((await self.cog.stats(guild))["channels"], 0)
         self.assertEqual(await self.cog.owner_of(channel), 42)  # topic still names them
         await self.cog.clear_last_group(GUILD_ID)
         await self.deliver(guild, [member], batch_id=2)
         self.assertEqual(len(guild.created), 2)
+
+    async def test_member_cannot_delete_own_channel(self):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        await self.deliver(guild, [member], batch_id=1)
+        channel = guild.created[0]
+        with self.assertRaises(PermissionError):
+            await self.cog.close_ticket(channel, closed_by=member)
+        self.assertIsNone(channel.deleted)
+        self.assertEqual((await self.cog.stats(guild))["channels"], 1)
+
+    async def make_close_interaction(self, *, moderator=False):
+        guild = FakeGuild()
+        member = FakeMember(guild, 42, "lemon")
+        await self.deliver(guild, [member], batch_id=1)
+        user = (
+            FakeMember(guild, 7, "moderator", roles=[FakeRole(1542915539872125049, 4)])
+            if moderator else member
+        )
+        return SimpleNamespace(
+            guild=guild, channel=guild.created[0], user=user,
+            client=SimpleNamespace(get_cog=lambda name: self.cog),
+            response=SimpleNamespace(send_message=AsyncMock(), edit_message=AsyncMock()),
+            edit_original_response=AsyncMock(),
+        )
+
+    async def test_member_close_button_is_denied(self):
+        interaction = await self.make_close_interaction()
+        await ask_to_close(interaction)
+        interaction.response.send_message.assert_awaited_once()
+        args, kwargs = interaction.response.send_message.call_args
+        self.assertIn("Only moderators", args[0])
+        self.assertIn("1542915539872125049", args[0])
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertNotIn("view", kwargs)
+        self.assertIsNone(interaction.channel.deleted)
+
+    async def test_moderator_button_and_confirmation_delete_channel(self):
+        interaction = await self.make_close_interaction(moderator=True)
+        await ask_to_close(interaction)
+        confirmation = interaction.response.send_message.call_args.kwargs["view"]
+        self.assertIsInstance(confirmation, CloseConfirmView)
+        await confirmation.confirm.callback(interaction)
+        self.assertIn("closed by moderator", interaction.channel.deleted)
+
+    async def test_confirmation_rechecks_role_after_it_is_removed(self):
+        interaction = await self.make_close_interaction(moderator=True)
+        await ask_to_close(interaction)
+        confirmation = interaction.response.send_message.call_args.kwargs["view"]
+        interaction.user.roles.clear()
+        await confirmation.confirm.callback(interaction)
+        self.assertIsNone(interaction.channel.deleted)
+        interaction.response.edit_message.assert_awaited_once()
+        self.assertIn(
+            "Not allowed", interaction.response.edit_message.call_args.kwargs["embed"].title
+        )
+
+    async def test_member_cannot_use_confirmation_directly(self):
+        interaction = await self.make_close_interaction()
+        confirmation = CloseConfirmView(interaction.channel.id)
+        await confirmation.confirm.callback(interaction)
+        self.assertIsNone(interaction.channel.deleted)
+        self.assertIn(
+            "Not allowed", interaction.response.edit_message.call_args.kwargs["embed"].title
+        )
 
     async def test_channel_deleted_by_hand_is_forgotten(self):
         guild = FakeGuild()

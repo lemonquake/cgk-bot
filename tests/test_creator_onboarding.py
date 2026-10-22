@@ -380,7 +380,8 @@ class QuestionnaireCompletionTests(unittest.TestCase):
         _, interaction, followups = self.finish(in_ticket=True, granted=False)
         post = interaction.channel.sent[0]["content"]
         self.assertIn("our team will give you access shortly", post)
-        self.assertIn("could not be granted to <@42>", post)
+        self.assertIn("roles could not be updated for <@42>", post)
+        self.assertIn("remove the Onboarding role", post)
         self.assertNotIn("full access", post)
 
     def test_falls_back_to_private_reply_if_channel_post_fails(self):

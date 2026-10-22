@@ -76,9 +76,7 @@ restart. The new extension creates its database table automatically.
    any channel and press **📝 Post questionnaire** — as many times and in as many
    channels as you like. Every copy works and survives restarts.
 3. Members click **Start onboarding**, fill in the form and submit.
-4. Four answers are required: TikTok handle, email, last 30 days TikTok GMV, and
-   phone number. GMV accepts the member's amount and currency as text. Birthday,
-   the last question, is optional, in `MM/DD` format; no birth year is collected.
+4. Three answers are required: TikTok handle, email, and phone number.
    The member's Discord account is captured automatically, so it isn't asked.
 5. The member gets a private confirmation. Answers are never posted to the public
    Discord channel. The public card explains that the bot saves responses and
@@ -89,7 +87,7 @@ The bot needs **View Channel**, **Send Messages**, **Embed Links**, and
 and **Embed Links** in any other channel you post a copy to). The member button survives bot
 restarts. Members can submit once per server; duplicate submissions do not send
 duplicate Slack posts. Moderators can collect corrections separately; this version
-does not include a response-editing interface or automatic birthday greetings.
+does not include a response-editing interface.
 
 ## Delivery and troubleshooting
 

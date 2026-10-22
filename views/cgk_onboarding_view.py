@@ -787,7 +787,7 @@ async def build_cgk_hub_embed(interaction: discord.Interaction) -> discord.Embed
             "**🧪 Test on myself / member** (or `/test-onboarding`) opens a test channel to click through."
         ),
         embed_builder.item(
-            "**🔒 Close onboarding** in a channel lets the member or any moderator delete it."
+            "**🔒 Close onboarding** in a channel lets moderators with the designated role delete it."
         ),
         embed_builder.item(
             "**🔍 Scan** groups recent members by join day — or select a **single member** to onboard individually."
