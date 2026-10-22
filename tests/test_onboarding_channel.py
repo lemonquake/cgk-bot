@@ -9,10 +9,10 @@ import discord
 from cogs.cgk_onboarding import CategoryFull
 from views.mod_panel_view import ModPanelView
 from views.onboarding_channel_view import (
-    OnboardingChannelView,
+    AutoOnboardingView,
     OnboardingStartView,
     onboarding_channel_embed,
-    open_onboarding_channel_picker,
+    open_auto_onboarding_toggle,
 )
 from views.creator_onboarding_view import OnboardingTicketView
 
@@ -119,7 +119,7 @@ class EntryButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.children[0].label, "START MY ONBOARDING")
         panel = ModPanelView()
         self.assertTrue(panel.is_persistent())
-        self.assertIn("Onboarding Channel", [child.label for child in panel.children])
+        self.assertIn("Auto Onboarding", [child.label for child in panel.children])
         for row in range(5):
             self.assertLessEqual(sum(child.row == row for child in panel.children), 5)
         self.assertIn("full access", onboarding_channel_embed().description)
@@ -138,60 +138,51 @@ class EntryButtonTests(unittest.IsolatedAsyncioTestCase):
             await bot.close()
 
 
-class ChannelPickerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_only_moderators_can_open_and_use_picker(self):
-        denied = interaction_for(admin=False)
-        await open_onboarding_channel_picker(denied)
-        self.assertNotIn("view", denied.followup.send.call_args.kwargs)
-        self.assertFalse(await OnboardingChannelView().interaction_check(denied))
-        allowed = interaction_for(admin=True)
-        await open_onboarding_channel_picker(allowed)
-        self.assertTrue(allowed.response.send_message.call_args.kwargs["ephemeral"])
-        self.assertIsInstance(
-            allowed.response.send_message.call_args.kwargs["view"], OnboardingChannelView
+class AutoOnboardingToggleTests(unittest.IsolatedAsyncioTestCase):
+    def toggle_cog(self, enabled=False, problems=()):
+        return SimpleNamespace(
+            auto_enabled=AsyncMock(return_value=enabled),
+            set_auto_enabled=AsyncMock(),
+            settings=AsyncMock(return_value=object()),
+            auto_problems=lambda guild, settings: list(problems),
         )
 
-    async def test_selecting_channel_only_prepares_the_post(self):
-        channel = FakeTextChannel()
-        interaction = interaction_for(channel=channel, admin=True)
-        view = OnboardingChannelView()
-        self.assertTrue(view.post.disabled)
-        select = view.children[-1]
-        self.assertIsInstance(select, discord.ui.ChannelSelect)
-        select._values = [SimpleNamespace(id=channel.id)]
-        await select.callback(interaction)
-        self.assertEqual(view.channel_id, channel.id)
-        self.assertFalse(view.post.disabled)
-        channel.send.assert_not_awaited()
+    async def test_only_moderators_can_open_and_use_the_switch(self):
+        cog = self.toggle_cog()
+        denied = interaction_for(cog, admin=False)
+        await open_auto_onboarding_toggle(denied)
+        denied.response.send_message.assert_not_awaited()
+        self.assertFalse(await AutoOnboardingView(False).interaction_check(denied))
+        allowed = interaction_for(cog, admin=True)
+        await open_auto_onboarding_toggle(allowed)
+        sent = allowed.response.send_message.call_args.kwargs
+        self.assertTrue(sent["ephemeral"])
+        self.assertIsInstance(sent["view"], AutoOnboardingView)
+        self.assertIn("OFF", sent["embed"].description)
 
-    async def test_publish_posts_description_and_persistent_button_in_selected_channel(self):
-        channel = FakeTextChannel()
-        interaction = interaction_for(channel=channel, admin=True)
-        view = OnboardingChannelView()
-        view.channel_id = channel.id
-        await view.post.callback(interaction)
-        sent = channel.send.call_args.kwargs
-        self.assertIsInstance(sent["view"], OnboardingStartView)
-        self.assertTrue(sent["view"].is_persistent())
-        self.assertIn("full access", sent["embed"].description)
-        self.assertFalse(sent["allowed_mentions"].everyone)
-        self.assertIsNone(interaction.edit_original_response.call_args.kwargs["view"])
+    async def test_switch_shows_current_state_and_never_offers_channel_picker(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                view = AutoOnboardingView(enabled)
+                self.assertEqual(view.turn_on.disabled, enabled)
+                self.assertEqual(view.turn_off.disabled, not enabled)
+                self.assertFalse(any(isinstance(c, discord.ui.ChannelSelect) for c in view.children))
 
-    async def test_missing_channel_permissions_prevent_publishing(self):
-        channel = FakeTextChannel(permitted=False)
-        interaction = interaction_for(channel=channel, admin=True)
-        view = OnboardingChannelView()
-        view.channel_id = channel.id
-        await view.post.callback(interaction)
-        channel.send.assert_not_awaited()
-        self.assertIn("Embed Links", interaction.followup.send.call_args.args[0])
+    async def test_turning_on_and_off_saves_the_setting(self):
+        for enabled, button in ((True, "turn_on"), (False, "turn_off")):
+            with self.subTest(enabled=enabled):
+                cog = self.toggle_cog(not enabled, problems=["Missing role"])
+                interaction = interaction_for(cog, admin=True)
+                view = AutoOnboardingView(not enabled)
+                await getattr(view, button).callback(interaction)
+                cog.set_auto_enabled.assert_awaited_once_with(1, enabled)
+                edited = interaction.response.edit_message.call_args.kwargs
+                self.assertIn("ON" if enabled else "OFF", edited["embed"].description)
+                self.assertEqual("Missing role" in edited["embed"].description, enabled)
+                self.assertEqual(edited["view"].turn_off.disabled, not enabled)
 
-    async def test_deleted_channel_and_send_failure_keep_picker_available(self):
-        for channel in (None, FakeTextChannel(fail=True)):
-            with self.subTest(channel=channel):
-                interaction = interaction_for(channel=channel, admin=True)
-                view = OnboardingChannelView()
-                view.channel_id = 123
-                await view.post.callback(interaction)
-                self.assertTrue(interaction.followup.send.call_args.kwargs["ephemeral"])
-                interaction.edit_original_response.assert_not_awaited()
+    async def test_missing_module_is_reported(self):
+        interaction = interaction_for(None, admin=True)
+        await open_auto_onboarding_toggle(interaction)
+        interaction.response.send_message.assert_not_awaited()
+        self.assertIn("unavailable", interaction.followup.send.call_args.kwargs["embed"].title)

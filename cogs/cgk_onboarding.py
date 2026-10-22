@@ -62,7 +62,22 @@ CATEGORY_LIMIT = 50
 CREATE_PACE_SECONDS = 1.0
 PROGRESS_EVERY = 5
 ONBOARDING_MODERATOR_ROLE_ID = 1542915539872125049
+# The old Onboarding role. New members no longer get it, but anyone who still
+# holds it loses it on completion.
 ONBOARDING_PENDING_ROLE_ID = 1559649034598227968
+
+# Auto onboarding (Mod Panel -> Auto Onboarding): while it is ON, every member
+# who joins gets this role, loses sight of the hidden channel, and is sent
+# straight into their own private onboarding channel. Finishing onboarding
+# removes the role and shows the channel again.
+AUTO_ONBOARDING_ROLE_ID = 1562894069544255489
+AUTO_HIDDEN_CHANNEL_ID = 1377020906987065416
+AUTO_ONBOARDING_SETTING = "cgk_auto_onboarding"
+# The tagged group for members whose channel opened when they joined, so
+# scans skip them but "clear last tagged group" never picks them up.
+AUTO_JOIN_BATCH = 0
+# Roles that are taken away once a member finishes onboarding.
+TEMPORARY_ROLE_IDS = (AUTO_ONBOARDING_ROLE_ID, ONBOARDING_PENDING_ROLE_ID)
 
 # Roles with any of these can moderate, so they can see every onboarding channel.
 STAFF_PERMISSIONS = (
@@ -220,15 +235,112 @@ class CGKOnboardingCog(commands.Cog, name="CGKOnboardingCog"):
                 f"Move the bot's role **above** {role.mention} in Server Settings → Roles, "
                 "so it can hand that role out."
             )
-        if role is not None and role.id == ONBOARDING_PENDING_ROLE_ID:
+        if role is not None and role.id in TEMPORARY_ROLE_IDS:
             problems.append("Choose an access role other than the **Onboarding** role.")
-        pending_role = guild.get_role(ONBOARDING_PENDING_ROLE_ID)
-        if pending_role is not None and (pending_role.managed or pending_role >= me.top_role):
+        for temporary_id in TEMPORARY_ROLE_IDS:
+            temporary = guild.get_role(temporary_id)
+            if temporary is not None and (temporary.managed or temporary >= me.top_role):
+                problems.append(
+                    f"The bot must be above {temporary.mention}, and that role must "
+                    "be editable, so it can be removed on completion."
+                )
+        return problems
+
+    # -- auto onboarding ---------------------------------------
+    async def auto_enabled(self, guild_id: int) -> bool:
+        return await self.db.get_setting(guild_id, AUTO_ONBOARDING_SETTING) == "1"
+
+    async def set_auto_enabled(self, guild_id: int, enabled: bool) -> None:
+        await self.db.set_setting(guild_id, AUTO_ONBOARDING_SETTING, "1" if enabled else "0")
+
+    def auto_problems(self, guild: discord.Guild, settings: CGKSettings) -> list[str]:
+        """Everything that would stop a new member being onboarded on join."""
+        problems = self.setup_problems(guild, settings)
+        if guild.get_role(AUTO_ONBOARDING_ROLE_ID) is None:
+            problems.append(f"The onboarding role `{AUTO_ONBOARDING_ROLE_ID}` was not found.")
+        hidden = guild.get_channel(AUTO_HIDDEN_CHANNEL_ID)
+        if hidden is None:
+            problems.append(f"The channel to hide (`{AUTO_HIDDEN_CHANNEL_ID}`) was not found.")
+        elif not hidden.permissions_for(guild.me).manage_roles:
             problems.append(
-                "The bot must be above the **Onboarding** role, and that role must "
-                "be editable, so it can be removed on completion."
+                f"The bot needs **Manage Permissions** in {hidden.mention} to hide it "
+                "from new members."
             )
         return problems
+
+    async def _set_hidden(self, member: discord.Member, hidden: bool) -> None:
+        """Hides the hidden channel from one member, or removes that override."""
+        channel = member.guild.get_channel(AUTO_HIDDEN_CHANNEL_ID)
+        if channel is None:
+            return
+        if hidden:
+            await channel.set_permissions(
+                member, view_channel=False, reason="Auto onboarding: new member"
+            )
+        elif not channel.overwrites_for(member).is_empty():
+            await channel.set_permissions(
+                member, overwrite=None, reason="Auto onboarding: finished or left"
+            )
+
+    async def auto_onboard(self, member: discord.Member) -> discord.TextChannel | None:
+        """Role, hidden channel and private channel for a member who just joined."""
+        from views.creator_onboarding_view import OnboardingTicketView
+
+        guild = member.guild
+        role = guild.get_role(AUTO_ONBOARDING_ROLE_ID)
+        if role is None:
+            logger.warning("Auto onboarding role %s is missing in %s", AUTO_ONBOARDING_ROLE_ID, guild.id)
+        else:
+            try:
+                await member.add_roles(role, reason="Auto onboarding: new member")
+            except discord.HTTPException as exc:
+                logger.warning("Could not give %s the onboarding role: %s", member.id, exc)
+        try:
+            await self._set_hidden(member, True)
+        except discord.HTTPException as exc:
+            logger.warning("Could not hide %s from %s: %s", AUTO_HIDDEN_CHANNEL_ID, member.id, exc)
+
+        category = self.category(guild, await self.settings(guild.id))
+        if category is None:
+            logger.warning("Auto onboarding in %s: the onboarding category is missing", guild.id)
+            return None
+        try:
+            async with self._self_service_lock:
+                channel = await self._ticket_channel(guild, member.id)
+                if channel is not None:
+                    return channel
+                channel, _ = await self.open_ticket(
+                    member, category, OnboardingTicketView(),
+                    batch_id=AUTO_JOIN_BATCH, tagged_by=None,
+                )
+        except CategoryFull:
+            logger.warning("Auto onboarding in %s: the category is full", guild.id)
+            return None
+        except discord.HTTPException as exc:
+            logger.warning("Could not open an onboarding channel for %s: %s", member.id, exc)
+            return None
+        logger.info("Auto onboarding opened %s for %s", channel.id, member.id)
+        return channel
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        if member.bot:
+            return
+        try:
+            if await self.auto_enabled(member.guild.id):
+                await self.auto_onboard(member)
+        except Exception:  # noqa: BLE001 - a join must never crash the bot
+            logger.exception("Auto onboarding failed for %s", member.id)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member) -> None:
+        """Clears the hidden-channel override left by a member who never finished."""
+        if not any(role.id == AUTO_ONBOARDING_ROLE_ID for role in member.roles):
+            return
+        try:
+            await self._set_hidden(member, False)
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            logger.warning("Could not clear the hidden channel for %s", member.id, exc_info=True)
 
     # -- records -----------------------------------------------
     async def tagged_ids(self, guild_id: int) -> set[int]:
@@ -242,14 +354,14 @@ class CGKOnboardingCog(commands.Cog, name="CGKOnboardingCog"):
     async def pending_members(
         self, guild: discord.Guild, settings: CGKSettings | None = None
     ) -> list[discord.Member]:
-        """Recent members never tagged who still hold the Onboarding role and lack access."""
+        """Recent members never tagged who still hold an Onboarding role and lack access."""
         settings = settings or await self.settings(guild.id)
         members = await recent_members(guild, await self.tagged_ids(guild.id))
         role_id = settings.role_id
         return [
             m
             for m in members
-            if any(r.id == ONBOARDING_PENDING_ROLE_ID for r in m.roles)
+            if any(r.id in TEMPORARY_ROLE_IDS for r in m.roles)
             and not any(r.id == role_id for r in m.roles)
         ]
 
@@ -261,10 +373,10 @@ class CGKOnboardingCog(commands.Cog, name="CGKOnboardingCog"):
             """
             SELECT batch_id, COUNT(*) AS total, MAX(tagged_at) AS tagged_at
             FROM cgk_onboarding_members
-            WHERE guild_id = ? AND batch_id IS NOT NULL
+            WHERE guild_id = ? AND batch_id IS NOT NULL AND batch_id != ?
             GROUP BY batch_id ORDER BY MAX(tagged_at) DESC LIMIT 1
             """,
-            (guild_id,),
+            (guild_id, AUTO_JOIN_BATCH),
         )
         if row is None:
             return None
@@ -452,22 +564,28 @@ class CGKOnboardingCog(commands.Cog, name="CGKOnboardingCog"):
 
     # -- completion --------------------------------------------
     async def complete(self, member: discord.Member) -> bool:
-        """Grants the access role and logs completion. False if it could not."""
+        """
+        Grants the access role, takes the Onboarding roles away and shows the
+        hidden channel again, then logs completion. False if it could not.
+        """
         guild = member.guild
         settings = await self.settings(guild.id)
         role = self.role(guild, settings)
-        if role is None or role.id == ONBOARDING_PENDING_ROLE_ID:
+        if role is None or role.id in TEMPORARY_ROLE_IDS:
             logger.warning("CGK onboarding access role %s is missing or invalid", settings.role_id)
             return False
         try:
             if role not in member.roles:
                 await member.add_roles(role, reason="Completed CGK onboarding")
-            pending_role = guild.get_role(ONBOARDING_PENDING_ROLE_ID)
-            if pending_role is not None and pending_role in member.roles:
-                await member.remove_roles(pending_role, reason="Completed CGK onboarding")
+            for temporary in [r for r in member.roles if r.id in TEMPORARY_ROLE_IDS]:
+                await member.remove_roles(temporary, reason="Completed CGK onboarding")
         except discord.HTTPException as exc:
             logger.warning("Could not update onboarding roles for %s: %s", member.id, exc)
             return False
+        try:
+            await self._set_hidden(member, False)
+        except discord.HTTPException as exc:
+            logger.warning("Could not show %s to %s again: %s", AUTO_HIDDEN_CHANNEL_ID, member.id, exc)
         await self.db.execute(
             """
             INSERT INTO cgk_onboarding_members (user_id, guild_id, completed_at)

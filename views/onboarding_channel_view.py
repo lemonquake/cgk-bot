@@ -1,10 +1,10 @@
-"""Public onboarding entry point and moderator channel picker."""
+"""Public onboarding entry point and the moderator Auto Onboarding switch."""
 
 import logging
 
 import discord
 
-from cogs.cgk_onboarding import CategoryFull
+from cogs.cgk_onboarding import AUTO_HIDDEN_CHANNEL_ID, AUTO_ONBOARDING_ROLE_ID, CategoryFull
 from config import BRAND_NAME
 from utils import embed_builder
 from views.common import missing_cog, require_manage
@@ -90,90 +90,69 @@ class OnboardingStartView(discord.ui.View):
         )
 
 
-class OnboardingChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self):
-        super().__init__(
-            placeholder="Choose the channel for the onboarding button",
-            channel_types=[discord.ChannelType.text],
-            min_values=1,
-            max_values=1,
-            row=0,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.view
-        view.channel_id = self.values[0].id
-        view.post.disabled = False
-        await interaction.response.edit_message(
-            content=f"Selected <#{view.channel_id}>. Click **Post onboarding button** to publish.",
-            view=view,
-        )
+def auto_onboarding_embed(enabled: bool, problems: list[str] | None = None) -> discord.Embed:
+    state = "🟢 **ON**" if enabled else "🔴 **OFF**"
+    description = (
+        f"Auto onboarding is {state}.\n\n"
+        "While it is ON, every member who joins automatically gets the "
+        f"<@&{AUTO_ONBOARDING_ROLE_ID}> role, loses sight of <#{AUTO_HIDDEN_CHANNEL_ID}>, "
+        "and gets their own private onboarding channel. When they finish, they "
+        "get the access role, the onboarding roles are removed and the hidden "
+        "channel comes back.\n\n"
+        "While it is OFF, nothing happens when members join."
+    )
+    if enabled and problems:
+        description += "\n\n⚠️ **Fix these, or new members won't be onboarded properly:**\n"
+        description += "\n".join(f"• {problem}" for problem in problems)
+    return embed_builder.base_embed(title="Auto Onboarding", description=description)
 
 
-class OnboardingChannelView(discord.ui.View):
-    """A private moderator picker; publishing requires an explicit click."""
+class AutoOnboardingView(discord.ui.View):
+    """A private moderator switch; turning it ON or OFF takes effect at once."""
 
-    def __init__(self):
+    def __init__(self, enabled: bool):
         super().__init__(timeout=300)
-        self.channel_id = None
-        self.add_item(OnboardingChannelSelect())
-        self.post.disabled = True
+        self.turn_on.disabled = enabled
+        self.turn_off.disabled = not enabled
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await require_manage(interaction)
 
-    @discord.ui.button(
-        label="Post onboarding button", style=discord.ButtonStyle.success, row=1
-    )
-    async def post(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        channel = interaction.guild.get_channel(self.channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send(
-                "That channel could not be found. Please select a text channel.",
-                ephemeral=True,
-            )
+    async def _apply(self, interaction: discord.Interaction, enabled: bool) -> None:
+        cog = interaction.client.get_cog("CGKOnboardingCog")
+        if cog is None:
+            await missing_cog(interaction, "CGK Onboarding")
             return
-        permissions = channel.permissions_for(interaction.guild.me)
-        if not all(
-            getattr(permissions, name, False)
-            for name in ("view_channel", "send_messages", "embed_links")
-        ):
-            await interaction.followup.send(
-                f"The bot needs **View Channel**, **Send Messages**, and **Embed Links** "
-                f"in {channel.mention}.",
-                ephemeral=True,
-            )
-            return
-        try:
-            message = await channel.send(
-                embed=onboarding_channel_embed(),
-                view=OnboardingStartView(),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            logger.exception("Could not post the onboarding button in %s", channel.id)
-            await interaction.followup.send(
-                "Discord could not post the onboarding button. Check the bot's "
-                "channel permissions and try again.",
-                ephemeral=True,
-            )
-            return
-        await interaction.edit_original_response(
-            content=f"Onboarding button posted in {channel.mention}. [View message]({message.jump_url})",
-            view=None,
+        await cog.set_auto_enabled(interaction.guild.id, enabled)
+        logger.info(
+            "Auto onboarding turned %s in %s by %s",
+            "on" if enabled else "off", interaction.guild.id, interaction.user.id,
         )
-        self.stop()
+        problems = cog.auto_problems(interaction.guild, await cog.settings(interaction.guild.id))
+        await interaction.response.edit_message(
+            embed=auto_onboarding_embed(enabled, problems), view=AutoOnboardingView(enabled)
+        )
+
+    @discord.ui.button(label="Turn ON", style=discord.ButtonStyle.success, emoji="🟢")
+    async def turn_on(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply(interaction, True)
+
+    @discord.ui.button(label="Turn OFF", style=discord.ButtonStyle.danger, emoji="🔴")
+    async def turn_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply(interaction, False)
 
 
-async def open_onboarding_channel_picker(interaction: discord.Interaction):
+async def open_auto_onboarding_toggle(interaction: discord.Interaction):
     if not await require_manage(interaction):
         return
+    cog = interaction.client.get_cog("CGKOnboardingCog")
+    if cog is None:
+        await missing_cog(interaction, "CGK Onboarding")
+        return
+    enabled = await cog.auto_enabled(interaction.guild.id)
+    problems = cog.auto_problems(interaction.guild, await cog.settings(interaction.guild.id))
     await interaction.response.send_message(
-        content=(
-            "Select a channel, then click **Post onboarding button**. Members can "
-            "use **START MY ONBOARDING** there to begin the full onboarding flow."
-        ),
-        view=OnboardingChannelView(),
+        embed=auto_onboarding_embed(enabled, problems),
+        view=AutoOnboardingView(enabled),
         ephemeral=True,
     )

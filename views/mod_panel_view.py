@@ -15,7 +15,7 @@ from utils import embed_builder
 from views.announcement_view import open_announcements
 from views.cgk_onboarding_view import CGKOnboardingHubView, build_cgk_hub_embed
 from views.common import require_manage
-from views.onboarding_channel_view import open_onboarding_channel_picker
+from views.onboarding_channel_view import open_auto_onboarding_toggle
 from views.creator_onboarding_view import (
     CreatorOnboardingHubView,
     build_creator_hub_embed,
@@ -40,7 +40,7 @@ logger = logging.getLogger("cgk_bot.mod_panel_ui")
 FIELD_LIMIT = 1024
 
 FUNCTION_GUIDE = [
-    ("Onboarding Channel", "Choose a channel and post START MY ONBOARDING so members can begin their private onboarding."),
+    ("🚪 Auto Onboarding", "Turn ON or OFF: while ON, every new member gets the onboarding role and is sent straight into their own private onboarding channel."),
     ("🎟️ CGK Onboarding", "Scan new members and open a private #handle-onboarding channel for each — finishing it unlocks the server. 🧪 Test it on yourself (or /test-onboarding); 🔒 Close onboarding deletes a channel."),
     ("👋 Onboarding", "Open a private channel for each new member and tag them there with the TikTok Shop creator question (✅ YES / ❌ NO). 🧪 Test it in any channel."),
     ("ℹ️ Information Onboarding", "Welcome new members with a tagged post and warm DM, plus the member questionnaire."),
@@ -104,10 +104,12 @@ async def build_mod_panel_embed(
     if guild is not None and cgk_cog is not None:
         try:
             cgk_stats = await cgk_cog.stats(guild)
+            auto_on = await cgk_cog.auto_enabled(guild.id)
             embed.add_field(
                 name=embed_builder.section("CGK onboarding"),
                 value="\n".join(
                     [
+                        embed_builder.item(f"Auto onboarding: **{'ON' if auto_on else 'OFF'}**"),
                         embed_builder.item(f"Waiting to be tagged: **{cgk_stats['pending']}**"),
                         embed_builder.item(
                             f"Open onboarding channels: **{cgk_stats['channels']}** · "
@@ -281,15 +283,16 @@ class ModPanelView(discord.ui.View):
 
     # ── Row 0: onboarding ─────────────────────────────────────
     @discord.ui.button(
-        label="Onboarding Channel",
+        label="Auto Onboarding",
         style=discord.ButtonStyle.success,
         custom_id="cgk_mod_panel:onboarding_channel",
+        emoji="🚪",
         row=0,
     )
     async def onboarding_channel_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        await open_onboarding_channel_picker(interaction)
+        await open_auto_onboarding_toggle(interaction)
 
     @discord.ui.button(
         label="CGK Onboarding",
